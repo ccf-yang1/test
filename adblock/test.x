@@ -951,7 +951,6 @@ static NSUInteger gOverlayGeneration = 0;
 
 static CGPoint ABClampStartupOverlayCenter(CGPoint center, CGSize size);
 static CGPoint ABConfiguredStartupOverlayCenter(CGSize size);
-static void ABCancelStartupOverlayAutoHide(void);
 static void ABScheduleStartupOverlayAutoHide(void);
 static void ABSaveStartupOverlayPosition(CGPoint center, CGSize size);
 static void ABUpdateStartupOverlayPosition(void);
@@ -973,25 +972,29 @@ static void ABUpdateStartupOverlayPosition(void);
 
 - (void)pan:(UIPanGestureRecognizer *)gesture
 {
-    UIView *button = gesture.view;
-    UIView *container = button.superview;
-    if (!button || !container) {
+    UIWindow *window = gesture.view.window;
+    if (!window) {
         return;
     }
 
-    CGPoint translation = [gesture translationInView:container];
-    CGPoint center = button.center;
+    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    UIWindow *reference = [UIApplication sharedApplication].keyWindow;
+    if (!reference || reference == window) {
+        reference = window;
+    }
+    CGPoint translation = [gesture translationInView:reference];
+    CGPoint center = window.center;
     center.x += translation.x;
     center.y += translation.y;
-    center = ABClampStartupOverlayCenter(center, container.bounds.size);
-    button.center = center;
-    [gesture setTranslation:CGPointZero inView:container];
+    center = ABClampStartupOverlayCenter(center, screenSize);
+    window.center = center;
+    [gesture setTranslation:CGPointZero inView:reference];
 
     if (gesture.state == UIGestureRecognizerStateBegan) {
-        ABCancelStartupOverlayAutoHide();
+        ABScheduleStartupOverlayAutoHide();
     } else if (gesture.state == UIGestureRecognizerStateEnded ||
                gesture.state == UIGestureRecognizerStateCancelled) {
-        ABSaveStartupOverlayPosition(center, container.bounds.size);
+        ABSaveStartupOverlayPosition(center, screenSize);
         ABScheduleStartupOverlayAutoHide();
     }
 }
@@ -1112,11 +1115,6 @@ static void ABHideStartupOverlay(void)
     }
 }
 
-static void ABCancelStartupOverlayAutoHide(void)
-{
-    gOverlayGeneration += 1;
-}
-
 static void ABScheduleStartupOverlayAutoHide(void)
 {
     NSUInteger generation = ++gOverlayGeneration;
@@ -1153,20 +1151,15 @@ static void ABUpdateStartupOverlayAlpha(void)
 
 static void ABUpdateStartupOverlayPosition(void)
 {
-    if (!gOverlayButton) {
+    if (!gOverlayWindow) {
         return;
     }
 
-    UIView *container = gOverlayButton.superview;
-    if (!container) {
-        return;
-    }
-
-    CGSize size = container.bounds.size;
+    CGSize size = [UIScreen mainScreen].bounds.size;
     if (size.width <= 0.0 || size.height <= 0.0) {
         return;
     }
-    gOverlayButton.center =
+    gOverlayWindow.center =
         ABClampStartupOverlayCenter(ABConfiguredStartupOverlayCenter(size), size);
 }
 
@@ -1212,8 +1205,15 @@ static void ABShowStartupOverlay(void)
         }
     }
 
-    CGRect bounds = [UIScreen mainScreen].bounds;
-    UIWindow *window = [[UIWindow alloc] initWithFrame:bounds];
+    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    CGPoint center =
+        ABClampStartupOverlayCenter(ABConfiguredStartupOverlayCenter(screenSize),
+                                    screenSize);
+    CGRect windowFrame = CGRectMake(center.x - kABOverlayButtonWidth / 2.0,
+                                    center.y - kABOverlayButtonHeight / 2.0,
+                                    kABOverlayButtonWidth,
+                                    kABOverlayButtonHeight);
+    UIWindow *window = [[UIWindow alloc] initWithFrame:windowFrame];
     if (@available(iOS 13.0, *)) {
         window.windowScene = scene;
     }
@@ -1223,14 +1223,8 @@ static void ABShowStartupOverlay(void)
     UIViewController *controller = [[UIViewController alloc] init];
     controller.view.backgroundColor = [UIColor clearColor];
 
-    CGPoint center =
-        ABClampStartupOverlayCenter(ABConfiguredStartupOverlayCenter(bounds.size),
-                                    bounds.size);
     UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
-    button.frame = CGRectMake(center.x - kABOverlayButtonWidth / 2.0,
-                              center.y - kABOverlayButtonHeight / 2.0,
-                              kABOverlayButtonWidth,
-                              kABOverlayButtonHeight);
+    button.frame = CGRectMake(0.0, 0.0, kABOverlayButtonWidth, kABOverlayButtonHeight);
     button.backgroundColor = [UIColor colorWithWhite:0.0 alpha:ABOverlayAlpha()];
     [button setTitle:@"设置" forState:UIControlStateNormal];
     [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
