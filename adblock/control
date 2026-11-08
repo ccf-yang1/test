@@ -1,0 +1,9 @@
+Package: com.example.adblockconfig
+Name: AdBlockConfig
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Configurable URL ad blocker and request observer.
+Maintainer: example
+Author: example
+Section: Tweaks
+Depends: mobilesubstrate
