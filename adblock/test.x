@@ -38,12 +38,23 @@ static NSString *const kABWhitelistExceptionKey = @"AB_whitelist_exception";
 static NSString *const kABModeKey               = @"AB_mode";
 static NSString *const kABBlacklistKey          = @"AB_blacklist";
 static NSString *const kABWhitelistKey          = @"AB_whitelist";
+static NSString *const kABOverlayAlphaKey       = @"AB_overlay_alpha";
+static NSString *const kABOverlayCenterXKey     = @"AB_overlay_center_x";
+static NSString *const kABOverlayCenterYKey     = @"AB_overlay_center_y";
 
 static NSString *const kABBlockedURL            = @"http://127.0.0.1:1/__adblock_blocked__";
 static NSString *const kABBlockedURLPrefix      = @"http://127.0.0.1:1/__adblock_blocked__";
 
 static const NSInteger kABMaxLogEntries         = 300;
 static const NSTimeInterval kABGestureWindow    = 30.0;
+static const NSTimeInterval kABOverlayDuration  = 5.0;
+static const CGFloat kABOverlayDefaultAlpha     = 0.6;
+static const CGFloat kABOverlayButtonWidth      = 96.0;
+static const CGFloat kABOverlayButtonHeight     = 44.0;
+static const CGFloat kABOverlayEdgeMargin       = 24.0;
+static const CGFloat kABOverlayBottomExtra      = 34.0;
+static const CGFloat kABOverlayTopExtra         = 70.0;
+static const CGFloat kABOverlayDragMargin       = 8.0;
 
 typedef NS_ENUM(NSInteger, ABMode) {
     ABModeBlacklist = 0,
@@ -254,6 +265,9 @@ static NSArray<NSString *> *ABDefaultBlacklist(void)
 @property (atomic, assign) BOOL observer;
 @property (atomic, assign) BOOL whitelistException;
 @property (atomic, assign) NSInteger mode;
+@property (atomic, assign) CGFloat overlayAlpha;
+@property (atomic, assign) CGFloat overlayCenterX;
+@property (atomic, assign) CGFloat overlayCenterY;
 @property (atomic, copy)   NSArray<NSString *> *blacklist;
 @property (atomic, copy)   NSArray<NSString *> *whitelist;
 
@@ -303,6 +317,31 @@ static NSArray<NSString *> *ABDefaultBlacklist(void)
 
     self.mode = [d integerForKey:kABModeKey];
 
+    if ([d objectForKey:kABOverlayAlphaKey]) {
+        self.overlayAlpha = [d doubleForKey:kABOverlayAlphaKey];
+    } else {
+        self.overlayAlpha = kABOverlayDefaultAlpha;
+    }
+    if (self.overlayAlpha < 0.1) {
+        self.overlayAlpha = 0.1;
+    } else if (self.overlayAlpha > 1.0) {
+        self.overlayAlpha = 1.0;
+    }
+
+    if ([d objectForKey:kABOverlayCenterXKey] &&
+        [d objectForKey:kABOverlayCenterYKey]) {
+        self.overlayCenterX = [d doubleForKey:kABOverlayCenterXKey];
+        self.overlayCenterY = [d doubleForKey:kABOverlayCenterYKey];
+        if (self.overlayCenterX < 0.0 || self.overlayCenterX > 1.0 ||
+            self.overlayCenterY < 0.0 || self.overlayCenterY > 1.0) {
+            self.overlayCenterX = -1.0;
+            self.overlayCenterY = -1.0;
+        }
+    } else {
+        self.overlayCenterX = -1.0;
+        self.overlayCenterY = -1.0;
+    }
+
     NSArray *black = [d arrayForKey:kABBlacklistKey];
     NSArray *white = [d arrayForKey:kABWhitelistKey];
 
@@ -319,6 +358,9 @@ static NSArray<NSString *> *ABDefaultBlacklist(void)
     [d setBool:self.observer forKey:kABObserverKey];
     [d setBool:self.whitelistException forKey:kABWhitelistExceptionKey];
     [d setInteger:self.mode forKey:kABModeKey];
+    [d setDouble:self.overlayAlpha forKey:kABOverlayAlphaKey];
+    [d setDouble:self.overlayCenterX forKey:kABOverlayCenterXKey];
+    [d setDouble:self.overlayCenterY forKey:kABOverlayCenterYKey];
     [d setObject:self.blacklist forKey:kABBlacklistKey];
     [d setObject:self.whitelist forKey:kABWhitelistKey];
     [d synchronize];
@@ -331,6 +373,9 @@ static NSArray<NSString *> *ABDefaultBlacklist(void)
     self.observer = NO;
     self.whitelistException = YES;
     self.mode = ABModeBlacklist;
+    self.overlayAlpha = kABOverlayDefaultAlpha;
+    self.overlayCenterX = -1.0;
+    self.overlayCenterY = -1.0;
     self.blacklist = ABDefaultBlacklist();
     self.whitelist = @[];
     [self save];
@@ -725,6 +770,10 @@ static void ABStopGestureWindow(void)
     ABRemoveAllGestures();
 }
 
+static void ABShowStartupOverlay(void);
+static void ABHideStartupOverlay(void);
+static void ABUpdateStartupOverlayAlpha(void);
+
 @interface ABGestureHandler : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 - (void)handleGesture:(UITapGestureRecognizer *)gesture;
@@ -749,6 +798,7 @@ static void ABStopGestureWindow(void)
     }
 
     if ([ABSettingsPresenter presentNow]) {
+        ABHideStartupOverlay();
         ABStopGestureWindow();
     }
 }
@@ -845,6 +895,7 @@ static void ABStartGestureWindowIfNeeded(void)
     NSUInteger generation = gGestureGeneration;
 
     ABScanVisibleWindows(generation);
+    ABShowStartupOverlay();
 
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kABGestureWindow * NSEC_PER_SEC)),
@@ -881,6 +932,331 @@ static void ABBootScan(void)
             ABBootScan();
         }
     );
+}
+
+// ============================================================
+// 启动悬浮窗
+// ============================================================
+
+typedef NS_ENUM(NSInteger, ABOverlayCorner) {
+    ABOverlayCornerBottomRight = 0,
+    ABOverlayCornerBottomLeft,
+    ABOverlayCornerTopRight,
+    ABOverlayCornerTopLeft
+};
+
+static UIWindow *gOverlayWindow = nil;
+static UIButton *gOverlayButton = nil;
+static NSUInteger gOverlayGeneration = 0;
+
+static CGPoint ABClampStartupOverlayCenter(CGPoint center, CGSize size);
+static CGPoint ABConfiguredStartupOverlayCenter(CGSize size);
+static void ABCancelStartupOverlayAutoHide(void);
+static void ABScheduleStartupOverlayAutoHide(void);
+static void ABSaveStartupOverlayPosition(CGPoint center, CGSize size);
+static void ABUpdateStartupOverlayPosition(void);
+
+@interface ABOverlayTarget : NSObject
+- (void)tap:(id)sender;
+- (void)pan:(UIPanGestureRecognizer *)gesture;
+@end
+
+@implementation ABOverlayTarget
+
+- (void)tap:(id)sender
+{
+    if ([ABSettingsPresenter presentNow]) {
+        ABHideStartupOverlay();
+        ABStopGestureWindow();
+    }
+}
+
+- (void)pan:(UIPanGestureRecognizer *)gesture
+{
+    UIView *button = gesture.view;
+    UIView *container = button.superview;
+    if (!button || !container) {
+        return;
+    }
+
+    CGPoint translation = [gesture translationInView:container];
+    CGPoint center = button.center;
+    center.x += translation.x;
+    center.y += translation.y;
+    center = ABClampStartupOverlayCenter(center, container.bounds.size);
+    button.center = center;
+    [gesture setTranslation:CGPointZero inView:container];
+
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        ABCancelStartupOverlayAutoHide();
+    } else if (gesture.state == UIGestureRecognizerStateEnded ||
+               gesture.state == UIGestureRecognizerStateCancelled) {
+        ABSaveStartupOverlayPosition(center, container.bounds.size);
+        ABScheduleStartupOverlayAutoHide();
+    }
+}
+
+@end
+
+static ABOverlayTarget *gOverlayTarget = nil;
+
+static CGFloat ABOverlayAlpha(void)
+{
+    CGFloat alpha = [ABConfig shared].overlayAlpha;
+    if (alpha < 0.1) {
+        alpha = 0.1;
+    } else if (alpha > 1.0) {
+        alpha = 1.0;
+    }
+    return alpha;
+}
+
+static CGPoint ABClampStartupOverlayCenter(CGPoint center, CGSize size)
+{
+    CGFloat halfWidth = kABOverlayButtonWidth / 2.0;
+    CGFloat halfHeight = kABOverlayButtonHeight / 2.0;
+    CGFloat minX = halfWidth + kABOverlayDragMargin;
+    CGFloat maxX = size.width - halfWidth - kABOverlayDragMargin;
+    CGFloat minY = halfHeight + kABOverlayDragMargin;
+    CGFloat maxY = size.height - halfHeight - kABOverlayDragMargin;
+
+    if (center.x < minX) {
+        center.x = minX;
+    } else if (center.x > maxX) {
+        center.x = maxX;
+    }
+    if (center.y < minY) {
+        center.y = minY;
+    } else if (center.y > maxY) {
+        center.y = maxY;
+    }
+    return center;
+}
+
+static CGPoint ABDefaultStartupOverlayCenter(CGSize size)
+{
+    return CGPointMake(size.width - kABOverlayEdgeMargin - kABOverlayButtonWidth / 2.0,
+                       size.height - kABOverlayEdgeMargin - kABOverlayBottomExtra -
+                           kABOverlayButtonHeight / 2.0);
+}
+
+static BOOL ABHasCustomOverlayPosition(void)
+{
+    ABConfig *cfg = [ABConfig shared];
+    return cfg.overlayCenterX >= 0.0 && cfg.overlayCenterX <= 1.0 &&
+           cfg.overlayCenterY >= 0.0 && cfg.overlayCenterY <= 1.0;
+}
+
+static CGPoint ABConfiguredStartupOverlayCenter(CGSize size)
+{
+    if (ABHasCustomOverlayPosition()) {
+        ABConfig *cfg = [ABConfig shared];
+        return CGPointMake(cfg.overlayCenterX * size.width,
+                           cfg.overlayCenterY * size.height);
+    }
+    return ABDefaultStartupOverlayCenter(size);
+}
+
+static NSString *ABStartupOverlayPositionName(void)
+{
+    if (!ABHasCustomOverlayPosition()) {
+        return @"右下";
+    }
+
+    ABConfig *cfg = [ABConfig shared];
+    BOOL left = cfg.overlayCenterX < 0.5;
+    BOOL top = cfg.overlayCenterY < 0.5;
+    if (top) {
+        return left ? @"左上" : @"右上";
+    }
+    return left ? @"左下" : @"右下";
+}
+
+static UIWindowScene *ABOverlayScene(void)
+{
+    if (@available(iOS 13.0, *)) {
+        UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+        if (keyWindow.windowScene) {
+            return keyWindow.windowScene;
+        }
+
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) {
+                continue;
+            }
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                return (UIWindowScene *)scene;
+            }
+        }
+
+        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+            if (window.windowScene) {
+                return window.windowScene;
+            }
+        }
+    }
+    return nil;
+}
+
+static void ABHideStartupOverlay(void)
+{
+    gOverlayGeneration += 1;
+
+    UIWindow *window = gOverlayWindow;
+    gOverlayWindow = nil;
+    gOverlayButton = nil;
+
+    if (window) {
+        window.hidden = YES;
+        window.rootViewController = nil;
+    }
+}
+
+static void ABCancelStartupOverlayAutoHide(void)
+{
+    gOverlayGeneration += 1;
+}
+
+static void ABScheduleStartupOverlayAutoHide(void)
+{
+    NSUInteger generation = ++gOverlayGeneration;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kABOverlayDuration * NSEC_PER_SEC)),
+        dispatch_get_main_queue(),
+        ^{
+            if (generation == gOverlayGeneration) {
+                ABHideStartupOverlay();
+            }
+        }
+    );
+}
+
+static void ABSaveStartupOverlayPosition(CGPoint center, CGSize size)
+{
+    if (size.width <= 0.0 || size.height <= 0.0) {
+        return;
+    }
+
+    ABConfig *cfg = [ABConfig shared];
+    cfg.overlayCenterX = center.x / size.width;
+    cfg.overlayCenterY = center.y / size.height;
+    [cfg save];
+}
+
+static void ABUpdateStartupOverlayAlpha(void)
+{
+    if (!gOverlayButton) {
+        return;
+    }
+    gOverlayButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:ABOverlayAlpha()];
+}
+
+static void ABUpdateStartupOverlayPosition(void)
+{
+    if (!gOverlayButton) {
+        return;
+    }
+
+    UIView *container = gOverlayButton.superview;
+    if (!container) {
+        return;
+    }
+
+    CGSize size = container.bounds.size;
+    if (size.width <= 0.0 || size.height <= 0.0) {
+        return;
+    }
+    gOverlayButton.center =
+        ABClampStartupOverlayCenter(ABConfiguredStartupOverlayCenter(size), size);
+}
+
+static void ABSetStartupOverlayCorner(ABOverlayCorner corner)
+{
+    CGSize size = [UIScreen mainScreen].bounds.size;
+    if (size.width <= 0.0 || size.height <= 0.0) {
+        return;
+    }
+
+    BOOL left = (corner == ABOverlayCornerBottomLeft ||
+                 corner == ABOverlayCornerTopLeft);
+    BOOL top = (corner == ABOverlayCornerTopRight ||
+                corner == ABOverlayCornerTopLeft);
+    CGFloat centerX = left
+        ? kABOverlayEdgeMargin + kABOverlayButtonWidth / 2.0
+        : size.width - kABOverlayEdgeMargin - kABOverlayButtonWidth / 2.0;
+    CGFloat centerY = top
+        ? kABOverlayTopExtra + kABOverlayButtonHeight / 2.0
+        : size.height - kABOverlayEdgeMargin - kABOverlayBottomExtra -
+              kABOverlayButtonHeight / 2.0;
+
+    ABConfig *cfg = [ABConfig shared];
+    cfg.overlayCenterX = centerX / size.width;
+    cfg.overlayCenterY = centerY / size.height;
+    [cfg save];
+    ABUpdateStartupOverlayPosition();
+}
+
+static void ABShowStartupOverlay(void)
+{
+    if (gOverlayWindow && !gOverlayWindow.isHidden) {
+        ABUpdateStartupOverlayAlpha();
+        ABUpdateStartupOverlayPosition();
+        return;
+    }
+
+    UIWindowScene *scene = nil;
+    if (@available(iOS 13.0, *)) {
+        scene = ABOverlayScene();
+        if (!scene) {
+            return;
+        }
+    }
+
+    CGRect bounds = [UIScreen mainScreen].bounds;
+    UIWindow *window = [[UIWindow alloc] initWithFrame:bounds];
+    if (@available(iOS 13.0, *)) {
+        window.windowScene = scene;
+    }
+    window.windowLevel = UIWindowLevelAlert + 50;
+    window.backgroundColor = [UIColor clearColor];
+
+    UIViewController *controller = [[UIViewController alloc] init];
+    controller.view.backgroundColor = [UIColor clearColor];
+
+    CGPoint center =
+        ABClampStartupOverlayCenter(ABConfiguredStartupOverlayCenter(bounds.size),
+                                    bounds.size);
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    button.frame = CGRectMake(center.x - kABOverlayButtonWidth / 2.0,
+                              center.y - kABOverlayButtonHeight / 2.0,
+                              kABOverlayButtonWidth,
+                              kABOverlayButtonHeight);
+    button.backgroundColor = [UIColor colorWithWhite:0.0 alpha:ABOverlayAlpha()];
+    [button setTitle:@"设置" forState:UIControlStateNormal];
+    [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+
+    if (!gOverlayTarget) {
+        gOverlayTarget = [[ABOverlayTarget alloc] init];
+    }
+    [button addTarget:gOverlayTarget
+               action:@selector(tap:)
+     forControlEvents:UIControlEventTouchUpInside];
+
+    UIPanGestureRecognizer *pan =
+        [[UIPanGestureRecognizer alloc] initWithTarget:gOverlayTarget
+                                                action:@selector(pan:)];
+    pan.minimumNumberOfTouches = 1;
+    pan.maximumNumberOfTouches = 1;
+    [button addGestureRecognizer:pan];
+
+    [controller.view addSubview:button];
+    window.rootViewController = controller;
+    window.hidden = NO;
+
+    gOverlayWindow = window;
+    gOverlayButton = button;
+
+    ABScheduleStartupOverlayAutoHide();
 }
 
 // ============================================================
@@ -1006,7 +1382,9 @@ typedef NS_ENUM(NSInteger, ABSettingsSection) {
 - (void)modeChanged:(UISegmentedControl *)segmented;
 - (void)showAddKeywordBlacklist:(BOOL)blacklist;
 - (void)showTestDialog;
+- (void)showPositionDialog;
 - (void)confirmReset;
+- (void)overlayAlphaChanged:(UISlider *)slider;
 - (void)done;
 @end
 
@@ -1058,7 +1436,7 @@ typedef NS_ENUM(NSInteger, ABSettingsSection) {
         case ABSettingsSectionLogs:
             return 2;
         case ABSettingsSectionTools:
-            return 2;
+            return 4;
         default:
             return 0;
     }
@@ -1098,7 +1476,7 @@ typedef NS_ENUM(NSInteger, ABSettingsSection) {
         case ABSettingsSectionLogs:
             return @"观察者模式开启后，这里会记录 App 请求过的域名，方便找广告域名。";
         case ABSettingsSectionTools:
-            return @"修改后立即生效；建议重启 App，让启动阶段也按新配置执行。";
+            return @"启动时会在右下角显示 5 秒“设置”悬浮窗，按住可拖动位置；点击可直接打开本页。三指双击仍然有效。透明度与位置在下次启动生效。";
         default:
             return nil;
     }
@@ -1201,13 +1579,35 @@ typedef NS_ENUM(NSInteger, ABSettingsSection) {
 
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
                                                    reuseIdentifier:nil];
-    if (row == 0) {
-        cell.textLabel.text = @"测试域名 / URL";
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else {
-        cell.textLabel.text = @"恢复默认配置";
-        cell.textLabel.textColor = [UIColor systemRedColor];
+    if (section == ABSettingsSectionTools) {
+        if (row == 0) {
+            cell.textLabel.text = @"测试域名 / URL";
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else if (row == 1) {
+            cell.textLabel.text = @"启动悬浮窗透明度";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+            UISlider *slider = [[UISlider alloc] init];
+            slider.frame = CGRectMake(0, 0, 160, 32);
+            slider.minimumValue = 0.1;
+            slider.maximumValue = 1.0;
+            slider.value = cfg.overlayAlpha;
+            [slider addTarget:self
+                       action:@selector(overlayAlphaChanged:)
+             forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = slider;
+        } else if (row == 2) {
+            cell.textLabel.text =
+                [NSString stringWithFormat:@"悬浮窗位置：%@",
+                 ABStartupOverlayPositionName()];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else {
+            cell.textLabel.text = @"恢复默认配置";
+            cell.textLabel.textColor = [UIColor systemRedColor];
+        }
+        return cell;
     }
+
     return cell;
 }
 
@@ -1274,10 +1674,48 @@ forRowAtIndexPath:(NSIndexPath *)indexPath
     if (section == ABSettingsSectionTools) {
         if (row == 0) {
             [self showTestDialog];
-        } else {
+        } else if (row == 2) {
+            [self showPositionDialog];
+        } else if (row == 3) {
             [self confirmReset];
         }
     }
+}
+
+- (void)overlayAlphaChanged:(UISlider *)slider
+{
+    ABConfig *cfg = [ABConfig shared];
+    cfg.overlayAlpha = slider.value;
+    [cfg save];
+    ABUpdateStartupOverlayAlpha();
+}
+
+- (void)showPositionDialog
+{
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"悬浮窗位置"
+                                            message:@"也可以直接在启动悬浮窗上拖动；选择四角会覆盖拖动位置。"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+
+    void (^addCorner)(NSString *, ABOverlayCorner) =
+        ^(NSString *title, ABOverlayCorner corner) {
+            [alert addAction:[UIAlertAction actionWithTitle:title
+                                                      style:UIAlertActionStyleDefault
+                                                    handler:^(UIAlertAction *action) {
+                ABSetStartupOverlayCorner(corner);
+                [self.tableView reloadData];
+            }]];
+        };
+
+    addCorner(@"右下角（默认）", ABOverlayCornerBottomRight);
+    addCorner(@"左下角", ABOverlayCornerBottomLeft);
+    addCorner(@"右上角", ABOverlayCornerTopRight);
+    addCorner(@"左上角", ABOverlayCornerTopLeft);
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)switchChanged:(UISwitch *)sw
@@ -1421,6 +1859,8 @@ forRowAtIndexPath:(NSIndexPath *)indexPath
                                               style:UIAlertActionStyleDestructive
                                             handler:^(UIAlertAction *action) {
         [[ABConfig shared] resetDefaults];
+        ABUpdateStartupOverlayAlpha();
+        ABUpdateStartupOverlayPosition();
         [self.tableView reloadData];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
