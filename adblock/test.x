@@ -1,3 +1,4 @@
+
 // test.x
 // 可配置的 URL 广告拦截 / 观察器
 //
@@ -6,7 +7,7 @@
 //   2. 黑名单模式 / 白名单模式；
 //   3. 观察者模式：只记录域名，不拦截；
 //   4. 关网开关：临时阻断当前 App 所有 http/https 请求，用于判断广告是否来自远端；
-//   5. 启动后 10 秒内三指双击打开设置；
+//   5. 启动后 30 秒内三指双击打开设置（覆盖较长的开屏广告）；
 //   6. 配置本地保存，重启 App 后从启动阶段开始拦截。
 //
 // 说明：
@@ -42,7 +43,7 @@ static NSString *const kABBlockedURL            = @"http://127.0.0.1:1/__adblock
 static NSString *const kABBlockedURLPrefix      = @"http://127.0.0.1:1/__adblock_blocked__";
 
 static const NSInteger kABMaxLogEntries         = 300;
-static const NSTimeInterval kABGestureWindow    = 10.0;
+static const NSTimeInterval kABGestureWindow    = 30.0;
 
 typedef NS_ENUM(NSInteger, ABMode) {
     ABModeBlacklist = 0,
@@ -57,7 +58,8 @@ typedef NS_ENUM(NSInteger, ABMode) {
 @class ABLogViewController;
 
 @interface ABSettingsPresenter : NSObject
-+ (void)present;
++ (BOOL)presentNow;
++ (void)dismiss;
 @end
 
 // ============================================================
@@ -667,6 +669,15 @@ static const void *kABGestureKey = &kABGestureKey;
 static BOOL gGestureStarted = NO;
 static BOOL gGestureActive = NO;
 static NSUInteger gGestureGeneration = 0;
+static NSUInteger gGestureBootAttempts = 0;
+
+static BOOL ABWindowIsVisible(UIWindow *window)
+{
+    return window &&
+           !window.isHidden &&
+           window.alpha > 0.01 &&
+           window.windowLevel >= UIWindowLevelNormal;
+}
 
 static NSArray<UIWindow *> *ABAllWindows(void)
 {
@@ -682,9 +693,7 @@ static NSArray<UIWindow *> *ABAllWindows(void)
         }
     }
 
-    if (result.count == 0) {
-        [result addObjectsFromArray:[UIApplication sharedApplication].windows];
-    }
+    [result addObjectsFromArray:[UIApplication sharedApplication].windows];
 
     // 去重
     NSMutableArray<UIWindow *> *unique = [NSMutableArray array];
@@ -716,7 +725,7 @@ static void ABStopGestureWindow(void)
     ABRemoveAllGestures();
 }
 
-@interface ABGestureHandler : NSObject
+@interface ABGestureHandler : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 - (void)handleGesture:(UITapGestureRecognizer *)gesture;
 @end
@@ -739,15 +748,22 @@ static void ABStopGestureWindow(void)
         return;
     }
 
-    ABStopGestureWindow();
-    [ABSettingsPresenter present];
+    if ([ABSettingsPresenter presentNow]) {
+        ABStopGestureWindow();
+    }
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer
+{
+    return YES;
 }
 
 @end
 
 static void ABInstallGestureOnWindow(UIWindow *window)
 {
-    if (!window || !gGestureActive) {
+    if (!window || !gGestureActive || !ABWindowIsVisible(window)) {
         return;
     }
 
@@ -755,17 +771,43 @@ static void ABInstallGestureOnWindow(UIWindow *window)
         return;
     }
 
+    window.multipleTouchEnabled = YES;
+    window.rootViewController.view.multipleTouchEnabled = YES;
+
     UITapGestureRecognizer *gesture =
         [[UITapGestureRecognizer alloc] initWithTarget:[ABGestureHandler shared]
                                                 action:@selector(handleGesture:)];
     gesture.numberOfTouchesRequired = 3;
     gesture.numberOfTapsRequired = 2;
     gesture.cancelsTouchesInView = NO;
+    gesture.delaysTouchesBegan = NO;
     gesture.delaysTouchesEnded = NO;
+    gesture.delegate = [ABGestureHandler shared];
 
     [window addGestureRecognizer:gesture];
     objc_setAssociatedObject(window, kABGestureKey, gesture,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ABScanVisibleWindows(NSUInteger generation)
+{
+    if (!gGestureActive || generation != gGestureGeneration) {
+        return;
+    }
+
+    for (UIWindow *window in ABAllWindows()) {
+        if (ABWindowIsVisible(window)) {
+            ABInstallGestureOnWindow(window);
+        }
+    }
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(),
+        ^{
+            ABScanVisibleWindows(generation);
+        }
+    );
 }
 
 static void ABStartGestureWindowIfNeeded(void)
@@ -779,7 +821,14 @@ static void ABStartGestureWindowIfNeeded(void)
     }
 
     NSArray<UIWindow *> *windows = ABAllWindows();
-    if (windows.count == 0) {
+    BOOL hasVisibleWindow = NO;
+    for (UIWindow *window in windows) {
+        if (ABWindowIsVisible(window)) {
+            hasVisibleWindow = YES;
+            break;
+        }
+    }
+    if (!hasVisibleWindow) {
         return;
     }
 
@@ -787,11 +836,15 @@ static void ABStartGestureWindowIfNeeded(void)
     gGestureActive = YES;
 
     for (UIWindow *window in windows) {
-        ABInstallGestureOnWindow(window);
+        if (ABWindowIsVisible(window)) {
+            ABInstallGestureOnWindow(window);
+        }
     }
 
     gGestureGeneration += 1;
     NSUInteger generation = gGestureGeneration;
+
+    ABScanVisibleWindows(generation);
 
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kABGestureWindow * NSEC_PER_SEC)),
@@ -800,8 +853,32 @@ static void ABStartGestureWindowIfNeeded(void)
             if (generation != gGestureGeneration) {
                 return;
             }
-            gGestureActive = NO;
-            ABRemoveAllGestures();
+            ABStopGestureWindow();
+        }
+    );
+}
+
+static void ABBootScan(void)
+{
+    if (gGestureStarted) {
+        return;
+    }
+
+    ABStartGestureWindowIfNeeded();
+    if (gGestureStarted) {
+        return;
+    }
+
+    gGestureBootAttempts += 1;
+    if (gGestureBootAttempts >= 240) {
+        return;
+    }
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(),
+        ^{
+            ABBootScan();
         }
     );
 }
@@ -951,7 +1028,7 @@ typedef NS_ENUM(NSInteger, ABSettingsSection) {
 
 - (void)done
 {
-    [self dismissViewControllerAnimated:YES completion:nil];
+    [ABSettingsPresenter dismiss];
 }
 
 - (void)viewWillAppear:(BOOL)animated
@@ -1356,61 +1433,77 @@ forRowAtIndexPath:(NSIndexPath *)indexPath
 // ============================================================
 
 @interface ABSettingsPresenter ()
-+ (void)presentAttempt:(NSInteger)attempt;
 + (UIWindow *)activeWindow;
-+ (UIViewController *)topViewControllerFrom:(UIViewController *)root;
++ (UIWindowScene *)activeWindowScene;
 @end
+
+static UIWindow *gSettingsWindow = nil;
+static __weak UIWindow *gPreviousKeyWindow = nil;
 
 @implementation ABSettingsPresenter
 
-+ (void)present
++ (BOOL)presentNow
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self presentAttempt:0];
-    });
-}
+    if (gSettingsWindow && !gSettingsWindow.isHidden) {
+        [gSettingsWindow makeKeyAndVisible];
+        return YES;
+    }
 
-+ (void)presentAttempt:(NSInteger)attempt
-{
-    UIWindow *window = [self activeWindow];
-    if (!window) {
-        if (attempt < 10) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                [self presentAttempt:attempt + 1];
-            });
+    UIWindow *host = [self activeWindow];
+    UIWindowScene *scene = nil;
+    if (@available(iOS 13.0, *)) {
+        scene = host.windowScene;
+        if (!scene) {
+            scene = [self activeWindowScene];
         }
-        return;
-    }
-
-    UIViewController *top = [self topViewControllerFrom:window.rootViewController];
-    if (!top) {
-        if (attempt < 10) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                [self presentAttempt:attempt + 1];
-            });
+        if (!scene) {
+            return NO;
         }
-        return;
     }
 
-    if ([top isKindOfClass:[ABSettingsViewController class]]) {
-        return;
+    UIWindow *window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    if (@available(iOS 13.0, *)) {
+        window.windowScene = scene;
     }
+    window.windowLevel = UIWindowLevelAlert + 100;
+    window.backgroundColor = [UIColor whiteColor];
 
     ABSettingsViewController *settings =
         [[ABSettingsViewController alloc] initWithStyle:UITableViewStyleGrouped];
     UINavigationController *nav =
         [[UINavigationController alloc] initWithRootViewController:settings];
-    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    window.rootViewController = nav;
 
-    [top presentViewController:nav animated:YES completion:nil];
+    gPreviousKeyWindow = [UIApplication sharedApplication].keyWindow;
+    window.hidden = NO;
+    [window makeKeyAndVisible];
+    gSettingsWindow = window;
+    return YES;
+}
+
++ (void)dismiss
+{
+    UIWindow *window = gSettingsWindow;
+    gSettingsWindow = nil;
+    if (window) {
+        window.hidden = YES;
+        window.rootViewController = nil;
+    }
+
+    UIWindow *previous = gPreviousKeyWindow;
+    gPreviousKeyWindow = nil;
+    if (!previous) {
+        previous = [self activeWindow];
+    }
+    if (previous && !previous.isHidden) {
+        [previous makeKeyAndVisible];
+    }
 }
 
 + (UIWindow *)activeWindow
 {
+    UIWindow *fallback = nil;
     if (@available(iOS 13.0, *)) {
-        UIWindow *fallback = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) {
                 continue;
@@ -1420,50 +1513,54 @@ forRowAtIndexPath:(NSIndexPath *)indexPath
                 continue;
             }
             for (UIWindow *window in windowScene.windows) {
-                if (window.isKeyWindow && window.rootViewController) {
+                if (!ABWindowIsVisible(window)) {
+                    continue;
+                }
+                if (window.isKeyWindow) {
                     return window;
                 }
-                if (!fallback && window.rootViewController) {
+                if (!fallback) {
                     fallback = window;
                 }
-            }
-            if (fallback) {
-                return fallback;
             }
         }
     }
 
+    if (fallback) {
+        return fallback;
+    }
+
     UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-    if (keyWindow) {
+    if (ABWindowIsVisible(keyWindow)) {
         return keyWindow;
     }
 
     for (UIWindow *window in [UIApplication sharedApplication].windows) {
-        if (window.rootViewController) {
+        if (ABWindowIsVisible(window)) {
             return window;
         }
     }
     return nil;
 }
 
-+ (UIViewController *)topViewControllerFrom:(UIViewController *)root
++ (UIWindowScene *)activeWindowScene
 {
-    UIViewController *vc = root;
-    while (vc.presentedViewController) {
-        vc = vc.presentedViewController;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) {
+                continue;
+            }
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                return (UIWindowScene *)scene;
+            }
+        }
+        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+            if (window.windowScene) {
+                return window.windowScene;
+            }
+        }
     }
-
-    if ([vc isKindOfClass:[UINavigationController class]]) {
-        vc = ((UINavigationController *)vc).visibleViewController;
-    } else if ([vc isKindOfClass:[UITabBarController class]]) {
-        vc = ((UITabBarController *)vc).selectedViewController;
-    }
-
-    while (vc.presentedViewController) {
-        vc = vc.presentedViewController;
-    }
-
-    return vc;
+    return nil;
 }
 
 @end
@@ -1816,7 +1913,7 @@ static void ABInitialize(void)
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            ABStartGestureWindowIfNeeded();
+            ABBootScan();
         });
     }
 }
