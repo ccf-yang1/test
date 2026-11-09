@@ -11,6 +11,64 @@ const QODER_SECRET_KEYS = [
   'secret://aicoding.auth.userPlan'
 ];
 
+const OPEN_API = 'https://openapi.qoder.com.cn';
+
+// 来源一：Qoder CN CLI 的本地登录态（~/.qoder-cn/.auth/user）。
+// 实现参考 TokenTracker (xiufengsun) src/lib/qoder-cn-cli-limits.js 的
+// readQoderCnCliCredentials —— 官方 CLI 的 WASM 凭据编解码：AES-128-CBC，
+// key=iv=machine_id 前 16 字符，明文 JSON 取 security_oauth_token || access_token。
+function readCliCredentials() {
+  const root = (process.env.QODERCN_CONFIG_DIR || '').trim() || path.join(os.homedir(), '.qoder-cn');
+  try {
+    const encrypted = fs.readFileSync(path.join(root, '.auth', 'user'), 'utf8').trim();
+    const machineId = fs.readFileSync(path.join(root, '.auth', 'machine_id'), 'utf8').trim();
+    const key = Buffer.from(machineId.slice(0, 16), 'utf8');
+    if (key.length !== 16) return null;
+    const decipher = crypto.createDecipheriv('aes-128-cbc', key, key);
+    const user = JSON.parse(Buffer.concat([
+      decipher.update(Buffer.from(encrypted, 'base64')),
+      decipher.final()
+    ]).toString('utf8'));
+    const token = user.security_oauth_token || user.access_token;
+    return typeof token === 'string' && token.trim() ? token.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+// PAT（控制台「设置 → 个人访问令牌」创建）→ 换 openapi 可用的短时 Bearer。
+// 换取端点与响应字段参考 TokenTracker 同款实现：POST /api/v1/jobToken/exchange。
+// 注意：不传 onLog，响应体含 token，绝不进日志。
+async function exchangePatToken(pat) {
+  const { postRequest } = require('./http');
+  const res = await postRequest(
+    `${OPEN_API}/api/v1/jobToken/exchange`,
+    { Accept: 'application/json' },
+    { personal_token: pat },
+    8000, null, 'Qoder'
+  );
+  const j = (res && res.json) || {};
+  const t = j.token || j.device_token || j.access_token;
+  if (typeof t === 'string' && t.trim()) {
+    // expires_at 是 ISO；换出来的 job token 实测只有 24h，靠 server 侧到期前重换
+    const exp = Date.parse(String(j.expires_at || ''));
+    return { ok: true, accessToken: t.trim(), expiresAt: Number.isFinite(exp) ? exp : 0 };
+  }
+  const msg = res ? `HTTP ${res.http} ${String(res.raw || '').slice(0, 160)}` : '无响应';
+  return { ok: false, message: `PAT 换取 token 失败: ${msg}` };
+}
+
+// PAT 来源：环境变量 QODERCN_PERSONAL_ACCESS_TOKEN，或 daka 目录下 pat.txt（已 gitignore）。
+function readPat() {
+  const envPat = process.env.QODERCN_PERSONAL_ACCESS_TOKEN || '';
+  if (envPat.trim()) return envPat.trim();
+  try {
+    const f = path.join(__dirname, '..', 'pat.txt');
+    if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8').trim();
+  } catch {}
+  return '';
+}
+
 function appData() {
   return process.env.APPDATA || '';
 }
@@ -177,9 +235,11 @@ function readQoderToken() {
   if (process.platform !== 'win32') {
     return { ok: false, message: '自动读 token 只在 Windows 本机（已登录 Qoder）可用' };
   }
+  const cli = readCliCredentials();
+  if (cli) return { ok: true, accessToken: cli, source: 'cli-creds' };
   const { vscdb, localState } = qoderPaths();
   if (!fs.existsSync(vscdb) || !fs.existsSync(localState)) {
-    return { ok: false, message: '未找到 Qoder 登录态，请先在本机打开并登录 Qoder CN' };
+    return { ok: false, message: '未找到登录态：CLI 目录(~/.qoder-cn/.auth/user)和 IDE 目录(%APPDATA%\\QoderCN)都没有' };
   }
   const dbBuf = copyFileUnlocked(vscdb);
   const rows = readSqliteItemTable(dbBuf);
@@ -208,4 +268,4 @@ function readQoderToken() {
   return { ok: true, accessToken };
 }
 
-module.exports = { readQoderToken, qoderPaths };
+module.exports = { readQoderToken, qoderPaths, exchangePatToken, readPat, readCliCredentials };

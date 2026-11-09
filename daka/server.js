@@ -2,13 +2,25 @@
 
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const store = require('./lib/store');
 const { runAll, fetchCredits } = require('./lib/checkin');
 const { WsHub } = require('./lib/ws');
-const { readQoderToken } = require('./lib/local-token');
+const { readQoderToken, exchangePatToken, readPat } = require('./lib/local-token');
 
-const HOST = process.env.DAKA_HOST || '192.168.1.10';
+// 手机要访问的是局域网 IP，写死会在换网络后失效；没给 DAKA_HOST 时自动挑本机局域网 IPv4。
+function detectLanIp() {
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (a.family === 'IPv4' && !a.internal
+        && /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address)) return a.address;
+    }
+  }
+  return '127.0.0.1';
+}
+
+const HOST = process.env.DAKA_HOST || detectLanIp();
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC = path.join(__dirname, 'public');
 const MIME = {
@@ -68,26 +80,72 @@ function snapshot() {
   };
 }
 
-function loadLocalToken() {
-  const got = readQoderToken();
+function applyToken(got, cfg) {
+  if (!cfg.platforms.qoder) cfg.platforms.qoder = { enable: true };
+  cfg.platforms.qoder.accessToken = got.accessToken;
+  cfg.platforms.qoder.enable = true;
+  cfg.tokenSource = got.source || 'local-qoder';
+  cfg.tokenMessage = got.message || '已获取 token';
+  cfg.tokenExpiresAt = Number(got.expiresAt || 0);
+  store.saveConfig(cfg);
+  pushLog('已获取 Qoder token（来源: ' + cfg.tokenSource + '），无需手动填写');
+  return true;
+}
+
+// PAT 换来的 job token 实测只有 24h。服务不重启的话第二天就是过期 token，
+// 所以每次干活前先看到期时间，提前 1 小时用 pat.txt 重换一次。
+async function refreshPatToken() {
+  const cfg = store.loadConfig();
+  if (cfg.tokenSource !== 'qoder-pat') return;
+  const exp = Number(cfg.tokenExpiresAt || 0);
+  if (exp && Date.now() < exp - 3600 * 1000) return;
+  const pat = readPat();
+  if (!pat) return;
+  pushLog('PAT token 已到期或临近到期，重新换取…');
+  try {
+    const ex = await exchangePatToken(pat);
+    if (ex.ok) {
+      applyToken({ accessToken: ex.accessToken, expiresAt: ex.expiresAt, source: 'qoder-pat' }, cfg);
+    } else {
+      pushLog('PAT 重新换取失败: ' + (ex.message || '未知原因'));
+    }
+  } catch (e) {
+    pushLog('PAT 重新换取异常: ' + e.message);
+  }
+}
+
+async function loadLocalToken() {
   const cfg = store.loadConfig();
   cfg.host = HOST;
   cfg.port = PORT;
-  if (got.ok) {
-    if (!cfg.platforms.qoder) cfg.platforms.qoder = { enable: true };
-    cfg.platforms.qoder.accessToken = got.accessToken;
-    cfg.platforms.qoder.enable = true;
-    cfg.tokenSource = 'local-qoder';
-    cfg.tokenMessage = '已从本机 Qoder 自动读取 token';
-    store.saveConfig(cfg);
-    pushLog('已从本机 Qoder 自动读取 token，无需手动填写');
-    return true;
+
+  // 来源一/二：本机 Qoder CN（CLI 或 IDE 登录态）
+  const got = readQoderToken();
+  if (got.ok) return applyToken(got, cfg);
+
+  // 来源三：个人访问令牌 PAT → 换取短时 token
+  const pat = readPat();
+  if (pat) {
+    pushLog('本机未读到 Qoder 登录态，尝试用个人访问令牌(PAT)换取…');
+    try {
+      const ex = await exchangePatToken(pat);
+      if (ex.ok) return applyToken({ accessToken: ex.accessToken, expiresAt: ex.expiresAt, source: 'qoder-pat' }, cfg);
+      cfg.tokenSource = 'none';
+      cfg.tokenMessage = ex.message || 'PAT 换取失败';
+      store.saveConfig(cfg);
+      pushLog('PAT 换取失败: ' + cfg.tokenMessage);
+      pushLog('若令牌过期或无效，请到 qoder.com.cn 控制台「个人访问令牌」重新生成，更新 pat.txt');
+      return false;
+    } catch (e) {
+      pushLog('PAT 换取异常: ' + e.message);
+    }
   }
+
   cfg.tokenSource = 'none';
   cfg.tokenMessage = got.message || '未能自动读取 token';
   store.saveConfig(cfg);
-  pushLog('自动读取 token 失败: ' + cfg.tokenMessage);
-  pushLog('请先在本机打开并登录 Qoder CN，再重新运行 start.bat');
+  pushLog('读取 token 失败: ' + cfg.tokenMessage);
+  pushLog('可在本机登录 Qoder CN，或把个人访问令牌写入 daka/pat.txt 后重启');
   return false;
 }
 
@@ -119,6 +177,7 @@ async function doCheckin(names, trigger) {
   hub.broadcast({ type: 'running', running: true });
   pushLog(`开始签到 (${trigger || 'manual'}) ${names && names.length ? names.join(',') : '全部平台'}`);
   try {
+    await refreshPatToken();
     const cfg = store.loadConfig();
     const results = await runAll(
       cfg.platforms,
@@ -141,6 +200,7 @@ async function doCheckin(names, trigger) {
 
 async function doCredits() {
   if (creditsRunning) return { ok: false, message: '正在查询余额,请稍候' };
+  await refreshPatToken();
   const cfg = store.loadConfig();
   const q = cfg.platforms && cfg.platforms.qoder;
   if (!q || !q.accessToken) return { ok: false, message: '未配置 Qoder 凭证' };
@@ -339,7 +399,7 @@ hub.on('message', (client, msg) => {
 });
 
 store.loadConfig();
-loadLocalToken();
+loadLocalToken().catch(e => console.error('loadLocalToken error:', e.message));
 setInterval(tickAuto, 20 * 1000);
 tickAuto();
 

@@ -114,6 +114,7 @@ function publicConfig(cfg) {
     auto: cfg.auto,
     tokenSource: cfg.tokenSource || '',
     tokenMessage: cfg.tokenMessage || '',
+    tokenExpiresAt: Number(cfg.tokenExpiresAt || 0),
     platforms
   };
 }
