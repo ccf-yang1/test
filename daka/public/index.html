@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1419" />
+  <title>Qoder 打卡</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div>
+        <h1>Qoder 打卡</h1>
+        <p class="sub" id="phoneHint">手机打开 http://192.168.1.10:8787</p>
+      </div>
+      <div class="status-pill" id="connPill">连接中</div>
+    </header>
+
+    <section class="hero-actions">
+      <button class="primary big" id="btnCheckin">打开 · 打卡</button>
+      <button class="ghost big" id="btnCredits">获取余额</button>
+    </section>
+
+    <section class="card balance-card" id="balanceCard">
+      <div class="label">当前余额</div>
+      <div class="balance" id="balanceMain">--</div>
+      <div class="hint" id="balanceHint">随时可查，不走定时</div>
+      <div class="pkgs" id="balancePkgs"></div>
+    </section>
+
+    <section class="card auto-card">
+      <div class="row">
+        <div>
+          <div class="label">自动打卡</div>
+          <div class="hint" id="autoHint">10:01 首打，忘记则 11:00 补打</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="autoEnable" />
+          <span></span>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <div class="label">实时日志</div>
+        <button class="tiny" id="clearLive">清空</button>
+      </div>
+      <div class="logbox" id="liveLogs"></div>
+    </section>
+
+    <section class="card">
+      <div class="label">最近记录</div>
+      <div class="history" id="history"></div>
+    </section>
+
+    <section class="card">
+      <div class="label">凭证</div>
+      <p class="hint" id="tokenHint">启动时从本机已登录的 Qoder 自动读取，一般不用手填。</p>
+    </section>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>

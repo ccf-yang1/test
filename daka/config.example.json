@@ -1,0 +1,17 @@
+{
+  "host": "192.168.1.10",
+  "port": 8787,
+  "auto": {
+    "enable": true,
+    "hour": 10,
+    "minute": 1,
+    "catchupHour": 11,
+    "catchupMinute": 0
+  },
+  "platforms": {
+    "qoder": {
+      "enable": true,
+      "accessToken": ""
+    }
+  }
+}
