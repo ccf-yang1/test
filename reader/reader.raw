@@ -1,0 +1,1598 @@
+
+# 阅读页“稳定性”实现拆解 & Flutter 复刻规范
+
+> 目标读者：负责用 Flutter 实现阅读页的另一个 AI / 工程师。
+>
+> 范围：只讨论“排版稳定性”。即：同一章文本 + 同一组排版参数 + 同一页面尺寸下，页数、每页起止字符、每页显示的行集合必须可复现；不讨论书源解析、网络请求、缓存策略、UI 皮肤、翻页动画。
+>
+> 结论先行：原 App **并没有硬编码“每页多少行”**。它固定的是“排版输入”和“页框”，然后用 CoreText 的 `CTFramesetter` 对整章做一次排版，再逐页取“可见字符区间”。Flutter 复刻的关键不是照抄 CoreText API，而是建立同样的结构：
+>
+> 1. 排版参数只取一份不可变快照；
+> 2. 整章只做一次确定性排版；
+> 3. 页 = 排版结果中的连续行区间；
+> 4. 绘制复用同一份排版结果，而不是每页重新排版；
+> 5. 阅读进度用“源文本字符偏移”做锚点，而不是用页码。
+
+本文是上一轮分析中第 4 节“为什么行距和每页行数是固定的”的展开版：前半部分拆原 App 的实现，后半部分给出可直接交给另一个 AI 实现的 Flutter 规范、伪代码和验收测试。
+
+## 0. 分析背景与方法（先读这一节）
+
+### 0.1 分析对象
+
+- 文件：`test.ipa`，未加密的 iOS IPA，约 2.09 MB。
+- 技术栈：Objective-C + UIKit + CoreText；不是 SwiftUI，也不是 Flutter。
+- 分析方式：**纯静态逆向 + 离线数据验证**。没有运行 App，没有抓包，没有联网，也没有任何源码或符号表。
+- 因此下文说的“源码分析”，准确含义是：对 Mach-O 反汇编、Objective-C 运行时元数据、CFString/selector 引用做还原，再用真实数据做交叉验证。
+
+### 0.2 静态分析流程
+
+1. **拆包**
+   - 解压 IPA，查看 `Payload/Reader.app/`、`Info.plist` 和资源目录。
+   - 确认主二进制是 ARM64 Mach-O，且未加密，可以直接读 `__TEXT,__text`。
+
+2. **解析 Mach-O 与 Objective-C 元数据**
+   - 自写 Python 脚本解析 load commands 和 section：`__TEXT,__text`、`__objc_classlist`、`__objc_selrefs`、`__objc_methname`、`__cstring` 等。
+   - 通过 `class_ro_t` / method list 建立“类名 + 方法名 + IMP 地址”的映射。
+   - 解析 selector ref 和 CFString ref，把 `objc_msgSend` 调用还原成可读的 Objective-C 消息。
+   - 没有使用 IDA/Hopper/class-dump；整个流程只依赖 `llvm-objdump`、Python 标准库和公开的 Mach-O 结构。
+
+3. **全量反汇编**
+   - 用 `/usr/bin/llvm-objdump-18` 反汇编 `__TEXT,__text`，生成带 selector / CFString 注释的汇编文本。
+   - 对关键函数按地址切片，逐条读 ARM64 指令，恢复控制流、参数、返回值和分支条件。
+
+4. **从字符串和选择器反查实现**
+   - 先搜关键字：`divisionText`、`contentAttributes`、`lineSpacing`、`paragraphSpacing`、`CTFramesetter`、`resetFrameRef`、`drawRect`、`lccache_` 等。
+   - 再通过 `__objc_selrefs` → `__objc_methname` 找到 selector，结合方法映射定位 IMP。
+   - 对 `objc_msgSend` 的寄存器参数（x0~x7、d0~d7）做数据流追踪，判断实际调用的是哪个方法。objdump 的自动注释有时会滞后或偏移，必须用真实参数交叉确认。
+
+5. **恢复常量与公式**
+   - 从 `adrp/add` 计算 CFString / 对象地址；
+   - 从 literal pool 读浮点常量，例如 `1.25`、`1.65`、`0.3`、`100.0`；
+   - 结合寄存器和分支条件，还原 `max`、`min`、比较、循环等逻辑。
+
+6. **串联调用链**
+   - 阅读页：`TextRPageContainer divisionResponse` → `PaibanManager divisionText` → `CTFramesetterCreateFrame` / `CTFrameGetVisibleStringRange` → `onDivisionTextFinish` → `TextReadTV resetFrameRef` / `drawRect`。
+   - 导出/导入：`BookSourceEditVC onExportEvent` → `LCViewLayerDraw` vtable[0]（加密）→ `writeToFile`；`applicationOpenUrl:` → vtable[+0x28]（解密）→ `NSJSONSerialization` → `addModels:`。
+   - 缓存：`LCDiskCacheManager`、`BookDbManager`、`BookCacher` 等。
+
+7. **数据验证**
+   - XXTEA 不是“看起来像”：用恢复出的 key 实际解密了 App 包内的 `lpnet_modelInfo`，得到 1704 字节 JSON；错误 key 会被长度校验拒绝。这反向验证了 key、端序、trailer 和轮数。
+   - 包里没有找到真实 `.xbs` 样本，但导出、内部保存、iCloud 备份共用同一个加解密函数，因此格式判断可信。
+
+### 0.3 结论的置信度与边界
+
+- **高置信度**：页框公式、排版参数读取、文本归一化正则、CoreText 取帧循环、双栏配对、缓存键与 XXTEA 格式——都能在反汇编里逐条对应，并有字符串、常量、调用链交叉验证。
+- **中等置信度**：部分 Objective-C 方法边界来自方法映射表，个别地址的映射会偏移；遇到这种情况，本文以实际 `objc_msgSend` 的参数和上下文为准，而不是盲信注释。
+- **推断部分**：CoreText 的内部断行细节、不同 iOS 版本的行为差异、UI 层的动画/手势时序，没有运行时 trace，属于按 API 语义和静态代码推断。
+- **未覆盖**：书源解析的完整语法、网络层细节、缓存淘汰策略、非正文页面。本文只保留与“书页稳定性”相关的部分。
+
+### 0.4 对 Flutter 实现者的意义
+
+- 本文描述的是**行为与不变量**，不是要求逐像素复刻 iOS。Flutter 的字体、断行、Skia/Impeller 与 CoreText 不同，像素级一致既不现实也没必要。
+- 真正要复刻的是结构：固定页框 + 固定样式快照 + 整章一次排版 + 页 = 行区间 + 绘制复用排版结果 + 字符锚点。
+- 原实现里带经验系数的页高补偿、每页重建 framesetter 等做法，本文会明确标注“仅元数据/可改进”，避免实现者把偶然行为当成规范。
+- 因此，另一个 AI 实现完后，应重点通过本文第 12 节的验收测试来对齐“稳定性”，而不是拿截图逐像素比对。
+
+---
+
+## 1. 稳定性的定义与验收标准
+
+本文说的“稳定”，不是“和 iOS 像素级一模一样”，而是下面这些可测试的性质：
+
+| 编号 | 不变量 | 说明 |
+|---|---|---|
+| I1 | 输入快照不可变 | 一次分页过程中，字号、行距、段距、字距、字重、缩进、页宽、页高、单双栏都不能被中途修改 |
+| I2 | 页范围连续 | 第 i 页的结束位置 = 第 i+1 页的开始位置；不丢字、不重字 |
+| I3 | 页容量正确 | 除“单行本身高于页高”这种极端情况，任意一页的行高总和 ≤ 页高（允许极小 epsilon） |
+| I4 | 重复分页一致 | 相同输入连续分页两次，页数、每页起止字符、每页行区间完全相同 |
+| I5 | 排版/绘制同源 | 绘制时显示的行，必须就是分页时判定属于该页的行，不能出现“分页算了一套、绘制又排了一套” |
+| I6 | 必然推进 | 非空章节每页至少 1 行，循环偏移量严格递增，不存在死循环 |
+| I7 | 缓存有签名 | 任一排版输入变化都会导致布局签名变化，旧布局不会被误用 |
+| I8 | 进度以字符为锚 | 旋转、改字号、改边距、切单双栏后，仍能回到原来的文字位置，而不是原来的页码 |
+| I9 | 双栏阅读顺序正确 | 先左后右、先上后下；不重复、不遗漏 |
+| I10 | 极端输入可终止 | 空章节、超长段落、超窄页宽、超大段距、连续空行都能得到确定结果 |
+
+> 重要的认知纠正：**“每页行数固定”是结果，不是输入。** 真正固定的是页框尺寸和行度量。正文行高一致时，每页行数自然一致；标题页、段距落在页尾、单行超高时，行数可以不同，这是正常的。
+
+---
+
+## 2. 原 App 的稳定性实现拆解
+
+以下地址来自 ARM64 反汇编，仅用于追溯；实现 Flutter 版不需要这些地址。
+
+### 2.1 固定页面矩形
+
+`TextRPageContainerPage contentRectByScreenSize:left:`（`0x1000b1cf0`）：
+
+```text
+l = paiban[lMargin]
+r = paiban[rMargin]
+t = paiban[tMargin]
+b = paiban[bMargin]
+
+h     = max(screenH - t - b, 100)
+fullW = max(screenW - l - r, 100)
+halfW = max(screenW * 0.5 - l - r, 100)
+
+单栏：
+    x = l
+    w = fullW
+双栏左栏：
+    x = l
+    w = halfW
+双栏右栏：
+    x = screenW * 0.5 + l
+    w = halfW
+```
+
+要点：
+
+- 所有边距都来自**同一个排版参数字典** `curPaiban`。
+- 宽度、高度都有 `max(..., 100)` 的下限，避免极小值导致排版异常。
+- 双栏时不是“左右各减一次边距”，而是每栏宽度 = 半屏宽 − 左右边距；两栏之间的实际间隙 = `l + r`。
+- 分页时 `divisionResponse` 传入的文本视图高度还要再减 `20`：
+  `tvSize = (textViewL.frame.width, textViewL.frame.height - 20.0)`。
+  也就是说：**分页时用的高度比最终可视区域少 20pt，留出底部安全余量**。绘制时即使 frame 稍微多出一点，也不会把最后一行裁掉。
+
+### 2.2 固定排版参数快照
+
+`PaibanManager contentAttributes:paibanInfo:`（`0x100055724`）：
+
+```text
+fontSize = NSUserDefaults[tr_fontSize]，默认 20
+
+标题模式：
+    fontSize    = fontSize + paibanInfo[titleFontSizeOffset]
+    lineSpacing = paibanInfo[titleLineSpacing]
+    paraSpacing = paibanInfo[titleParaSpacing]
+    wordSpacing = paibanInfo[titleWordSpacing]
+    weight      = paibanInfo[titleFontWeight]
+正文模式：
+    lineSpacing = paibanInfo[lineSpacing]
+    paraSpacing = paibanInfo[paraSpacing]
+    wordSpacing = paibanInfo[wordSpacing]
+    weight      = paibanInfo[fontWeight]
+
+style.lineBreakMode    = 0   // word wrap
+style.alignment        = 3   // justified
+style.lineSpacing      = lineSpacing.floatValue
+style.paragraphSpacing = paraSpacing.floatValue
+attrs[NSFontAttributeName]            = [fontManager fontBySize:fontSize]
+attrs[NSParagraphStyleAttributeName]  = style
+if wordSpacing != 0:
+    attrs[NSKernAttributeName] = @(wordSpacing)
+if weight.integerValue != 0:
+    attrs[NSStrokeWidthAttributeName] = @(-weight)   // 伪粗体
+```
+
+稳定性含义：
+
+- 字号、行距、段距、字距、字重都来自**当次分页的 paibanInfo 快照**，不是每页去读一次 NSUserDefaults。
+- 标题和正文显式分成两个属性区间，标题区间长度 = `titlePrefix.length`，正文区间是剩余部分。
+- `lineSpacing`、`paragraphSpacing` 是段落样式属性，不参与“每页手动加多少行”的逻辑。
+
+### 2.3 文本先归一化，再排版
+
+`PaibanManager divisionText:cpTitle:cpIndex:tvSize:doubleCol:backHeights:paibanInfo:`（真实实现 `0x100055bfc`）：
+
+```text
+if text 为空:
+    text = "当前章节无内容"
+
+headIndent = paibanInfo[headIndent].integerValue
+indentStr  = "\n" + "　"(U+3000) * headIndent
+
+// 1) 把所有“换行及其两侧空白”折叠成“一个换行 + 缩进”
+body = replace(text, regex: \s*[\n\r]+\s*, template: indentStr)
+
+// 2) 只对整章首尾做一次 trim
+body = trim(body)
+
+// 3) 正文前面补一个“换行 + 缩进”，与标题分隔
+body = indentStr + body
+
+// 4) 标题前缀
+if backHeights == nil:
+    titlePrefix = cpTitle
+else:
+    titlePrefix = "\n\n" + cpTitle
+
+final = titlePrefix + body
+```
+
+稳定性含义：
+
+- **连续空行先被折叠**，不会因为空行数量不同导致页数抖动。
+- **缩进是文本字符（U+3000），不是 `firstLineHeadIndent`**。因此分页、重排、分页边界处理都只面对普通字符，不依赖排版引擎的“首行缩进”状态。
+- `trim` 只做整章首尾，不对每个段落单独 trim；否则会把刚加上的 U+3000 缩进又去掉。这是复刻时最容易踩的坑之一。
+- `\s*[\n\r]+\s*` 会把换行两侧的空格、制表符、全角空格一并吸收，保证换行形式唯一。
+- 标题和正文之间靠 `body` 开头的 `"\n"` 分隔；`backHeights != nil` 时额外加两个前导换行，属于向后补页时的视觉处理，不影响分页稳定性的核心逻辑。
+
+### 2.4 整章只建一次 framesetter，逐页连续取帧
+
+这是原实现稳定性的核心。
+
+```text
+attr = NSMutableAttributedString(string: final)
+给标题区间套 title attributes
+给正文区间套 body attributes
+
+framesetter = CTFramesetterCreateWithAttributedString(attr)
+
+offset = 0
+while offset < attr.length:
+    path  = CGPathCreateWithRect(CGRect(0, 0, width, height))
+    frame = CTFramesetterCreateFrame(
+                framesetter,
+                CFRange(offset, 0),
+                path,
+                NULL)
+    r = CTFrameGetVisibleStringRange(frame)
+
+    sub = [attr attributedSubstringFromRange:r]
+
+    if doubleCol:
+        每两个连续 sub 组成一个物理页的左右栏
+    else:
+        每个 sub 是一页
+
+    offset += sub.length
+```
+
+关键点：
+
+1. `framesetter` 是**整章一份**，不是每页一份。
+2. 每页只是同一个 framesetter 上的一个 `CFRange(offset, 0)` 和**完全相同**的页框。
+3. CoreText 会保持跨页的排版状态（断行、标点避头尾、justify 的段落上下文），所以第 N 页的断行不会因为“从剩余字符串重新开始排版”而产生累计漂移。
+4. 页边界直接来自 `CTFrameGetVisibleStringRange`，不靠“估算每页多少字/多少行”。
+5. `offset += visibleLength` 保证页与页首尾相接；如果 visibleLength 为 0，理论上会死循环，所以实现里必须加“至少推进 1 行/1 个字符”的保护（原实现靠最小页框 `100` 和 CoreText 对非空文本必然返回非空 range 来规避）。
+
+### 2.5 页高估算与几个常数
+
+同一函数里还有一段“页高元数据”计算：
+
+```text
+// 宽度、高度都先做 max(value, 100) 的下限
+w = max(width, 100)
+h = max(height, 100)
+
+// 让 framesetter 在“页高 + 100”的约束下给出建议高度
+suggested = CTFramesetterSuggestFrameSizeWithConstraints(
+                framesetter,
+                offset,
+                NULL,
+                CGSize(w, h + 100),
+                NULL)
+
+lineSpacing = 正文/标题当前的 lineSpacing
+paraSpacing = 正文/标题当前的 paragraphSpacing
+
+s12 = lineSpacing * 1.25
+s10 = paraSpacing * 1.65
+s13 = (s10 == 0) ? s12 : s10
+
+if 本页 substring 以 "\n" 结尾:
+    extra = s13
+else:
+    extra = s12
+
+measured = suggested.height + extra
+pageMetaHeight = max(measured, h * 0.3)
+```
+
+稳定性含义：
+
+- 这些 `1.25 / 1.65 / 0.3` 是**页高元数据补偿**，用于页面容器/滚动高度等显示层，**不是分页切分依据**。
+- 分页切分依据始终是 `CTFramesetterCreateFrame` + `CTFrameGetVisibleStringRange`。
+- Flutter 版不要把这些经验系数塞进“断页条件”，否则会人为制造页尾空白或丢行。Flutter 有真实行度量，直接用 `computeLineMetrics()`。
+- `max(height * 0.3)` 是防止建议高度异常小；`max(..., 100)` 是防止页框异常小。两者都是防御性下限。
+
+### 2.6 绘制复用同一排版结果
+
+`TextReadTV resetFrameRef`（`0x10005b5d4`）：
+
+```text
+attr = 当前页的 attributedSubstring
+framesetter = CTFramesetterCreateWithAttributedString(attr)
+path = CGPathCreateWithRect(self.bounds)
+frame = CTFrameCreate(framesetter, CFRange(0, 0), path, NULL)
+visible = CTFrameGetVisibleStringRange(frame)
+```
+
+`TextReadTV drawRect:`（`0x10005bed0`）：
+
+```text
+设置 textMatrix
+翻转 CTM（CoreText 与 UIKit 坐标原点不同）
+绘制选区路径
+CTFrameDraw(frame, context)
+```
+
+稳定性含义：
+
+- 绘制用的是**分页时保存下来的同一段 attributed substring**，以及同样的宽、同样的段落样式。
+- 因为分页边界恰好落在行边界上，所以对这段 substring 用同样的宽度重新排版，行结果与整章排版时一致。
+- 绘制高度用的是 `self.bounds`，而分页高度是 `textView 高度 - 20`。绘制区域略大，只会多出底部空白，不会少一行。
+- **一个理论上的小差异**：对“页面子串”重新建 framesetter 时，这一页的最后一行会被当成一个段落的最后一行，justify 的拉伸行为和整章排版时可能略有不同。它只影响观感，不影响页边界和行数。Flutter 版用下面的“块级排版 + 裁剪平移绘制”可以彻底避免这个问题。
+
+### 2.7 设置变化、旋转、双栏切换后的重建
+
+- `divisionResponse:cpTitle:cpIndex:`（`0x1000abf1c`）在后台队列里按当前 `curPaiban` 和当前文本视图尺寸重新分页。
+- `onDivisionTextFinish:cpIndex:`（`0x1000d8870`）把结果写入 `dicContents[cpIndex]`。
+  - 如果当前已有 `pageModel`，直接 `gotoCp:page:progress:usePageIndex:directShow:direction:animated:` 恢复位置。
+  - 否则重建 `ReadPageContainerPage` 列表。
+- 双栏判断 `doubleCol:`（`0x1000b16ac`）：
+  `isPad && width > height && LCSettingManager boolForKey:@"tr_iPadDoubleCol"`。
+  尺寸/方向一变，宽度、栏数、页框全部变化，必须重新分页。
+- 阅读进度保存的不是单纯页码，而是 `cpIndex + page + progress + usePageIndex` 这类组合。恢复时优先按进度/字符位置找页，而不是死认旧页码。
+
+稳定性含义：
+
+- “设置变了就整章重排”是正确的；不要试图在旧页面上局部修补行距。
+- 重排后必须用**文字位置**恢复，否则字号一变，原来的第 10 页可能对应完全不同的内容。
+
+### 2.8 双栏的稳定处理
+
+- 双栏不是把单栏页面横向切开，而是**用半屏宽重新分页**。
+- 分页仍然是一维的：先把整章按 `halfW × pageHeight` 切成一段段“栏”，再把连续两栏配成一个物理页。
+- 因此双栏的每栏行数、断行位置与单栏不同，但栏与栏之间的字符范围仍然连续。
+- 物理页数 = `ceil(栏数 / 2)`；最后一页可能只有左栏。
+- 阅读顺序：左栏 → 右栏 → 下一页。
+
+### 2.9 原实现的薄弱点（Flutter 版要补上）
+
+1. **没有显式布局签名/epoch**：采用“后台排版 + 主线程回调 + 章节索引字典”的方式。如果用户快速切章或改设置，旧任务的结果可能覆盖新结果。Flutter 版必须加 generation/epoch 丢弃过期结果。
+2. **每页绘制重新建 framesetter**：理论上存在页尾 justify 差异，且每页都有一次排版开销。Flutter 版用整章块级排版 + 裁剪绘制，排版和绘制 100% 同源。
+3. **依赖 CoreText 的稳定行为**：字体回退、系统版本、ICU 断行数据都可能改变结果。原 App 自带字体管理器，降低了这种风险；Flutter 版也必须自带字体并固定引擎版本。
+4. **页高补偿是经验值**：`1.25 / 1.65 / 0.3` 不具备跨引擎可移植性。Flutter 版应使用真实行度量，不要照搬这些系数做断页。
+
+---
+
+## 3. Flutter 复刻的总体设计
+
+### 3.1 为什么不能直接照搬 CoreText
+
+Flutter 没有 `CTFramesetter`，文本排版走 `dart:ui` / Skia（或 Impeller）的 Paragraph：
+
+- 不能对“同一个 framesetter + 不同 offset”连续取帧；
+- `TextPainter.layout()` 每次都是对给定字符串重新排版；
+- Flutter 没有 `paragraphSpacing` 这个属性；
+- `TextStyle.height` 的语义是“行高倍数”，不是 CoreText 的 `lineSpacing`（行间额外间距）；
+- 断行、标点避头尾、字体回退由 Flutter 引擎和 ICU 数据决定，跨平台/跨版本不保证完全一致。
+
+因此目标不是“像素级复刻 iOS”，而是**在 Flutter 内部建立可复现、可测试、绘制与分页同源的排版模型**。
+
+### 3.2 推荐架构：块级 TextPainter + 行区间 + 裁剪平移绘制
+
+把一章拆成若干“排版块”（标题块 + 每个正文段落一个块），每块只 layout 一次，得到：
+
+- 块内每一行的字符范围；
+- 块内每一行的相对 top / height；
+- 块的整体高度。
+
+分页时只做一件事：把这些行按顺序装进固定高度的页框，页 = 连续行区间。
+
+绘制时：
+
+- 对当前页涉及的每个块，`canvas.clipRect(pageRect)`；
+- 把块的坐标系平移到“该块相对当前页的位置”；
+- 直接 `TextPainter.paint()` 这个已经 layout 好的块。
+
+这样：
+
+- 分页和绘制用的是**同一个 TextPainter 实例、同一份行度量**；
+- 页边界不会因为“每页重新排版”而漂移；
+- 跨页的段落仍然是同一个 Paragraph，justify、标点避头尾、行高都保持段落上下文；
+- Flutter 没有 `paragraphSpacing` 的问题，用“块与块之间的显式垂直间距”解决，完全可控。
+
+### 3.3 与“每页 substring 重新 layout”的对比
+
+| 方案 | 优点 | 缺点 | 结论 |
+|---|---|---|---|
+| 每页 substring + `TextPainter.layout()` | 实现直观、内存小 | 页尾行被当成段落末行，justify/段距可能不同；每页重新断行，存在边界漂移风险 | 不推荐作为主方案 |
+| 整章一个 Paragraph + 按行裁剪绘制 | 同源、最稳 | 超长章节一个 Paragraph 的绘制/内存压力大，且 Flutter 无 paragraphSpacing | 不推荐 |
+| 块级 Paragraph（每段一块）+ 行区间分页 + 裁剪平移绘制 | 同源、段距可控、绘制只涉及当前页少数块、性能好 | 实现比“每页 substring”复杂一点 | **推荐** |
+
+---
+
+## 4. 数据模型
+
+建议按下面的类型组织（Dart 伪代码，字段可按项目风格调整）：
+
+```dart
+/// 一次分页使用的不可变排版快照。
+class PaibanConfig {
+  final double fontSize;          // 正文，默认 20
+  final double lineSpacing;       // 正文行间额外间距（px）
+  final double paragraphSpacing;  // 正文段间额外间距（px）
+  final double wordSpacing;       // 字距（px），对应 NSKern / Flutter letterSpacing
+  final int    fontWeight;        // 原 App：0 正常，非 0 伪粗体
+  final int    headIndent;        // 首行缩进的全角空格个数
+
+  final double titleFontSizeOffset;
+  final double titleLineSpacing;
+  final double titleParagraphSpacing;
+  final double titleWordSpacing;
+  final int    titleFontWeight;
+
+  final EdgeInsets margins;       // l/r/t/b
+  final bool   doubleColumn;
+  final double bottomSlack;       // 原实现是 20
+  final String fontFamily;        // 必须是 App 自带字体
+  final double naturalLineRatio;  // 字体自然行高 / fontSize，构建期标定后写死
+}
+
+class PageGeometry {
+  final Size screenSize;
+  final Rect contentRect;         // 只用于定位，不参与分页决策
+  final double columnWidth;       // 单栏或半屏栏宽
+  final double pageHeight;        // 分页与裁剪使用的高度（已减 bottomSlack）
+}
+
+class LineInfo {
+  final int blockIndex;
+  final int lineIndex;
+  final int blockCharStart;       // 块内 UTF-16 偏移
+  final int blockCharEnd;
+  final int sourceCharStart;      // 源文本 UTF-16 偏移（不含缩进）
+  final int sourceCharEnd;
+  final double topRel;            // 相对块顶部
+  final double height;
+  double get topAbs => blockTopAbs + topRel; // 由外层填充
+  double blockTopAbs;
+}
+
+class BlockLayout {
+  final TextPainter painter;      // 已经 layout 过，之后只 paint，不再 layout
+  final String text;              // 含 U+3000 缩进的展示文本
+  final int indentLen;            // U+3000 个数
+  final int sourceStart;
+  final int sourceEnd;
+  double topAbs;                  // 在整章流中的绝对顶部（组装 flow 时填充）
+  final double height;            // = painter.height
+  final double gapAfter;          // 段后间距
+  final List<LineInfo> lines;
+}
+
+class ColumnSlice {               // 单栏一页 / 双栏中的一栏
+  final double topAbs;            // 本栏第一行的绝对顶部
+  final double height;            // 裁剪高度 = pageHeight
+  final int firstLine;            // 在整章行数组中的下标（含）
+  final int lastLine;             // 不含
+  final int sourceStart;
+  final int sourceEnd;
+  final bool isTitleOnly;
+}
+
+class ChapterLayout {
+  final String sourceText;        // 锚点坐标系
+  final List<BlockLayout> blocks;
+  final List<LineInfo> lines;     // 扁平化，按阅读顺序
+  final List<ColumnSlice> columns;
+  final String signature;
+}
+```
+
+另外两个小类型：
+
+```dart
+class NormalizedChapter {
+  final List<String> paragraphs;  // 已折叠空行、已整章 trim、不含缩进
+  final String sourceText;        // paragraphs.join('\n')
+  final List<int> paragraphStarts;// 每段在 sourceText 中的起始偏移
+}
+
+class ReadingAnchor {
+  final int chapterIndex;
+  final int sourceOffset;         // 指向 sourceText 的 UTF-16 偏移
+  final double fraction;          // 章节内比例，作为文本变更后的兜底
+}
+```
+
+---
+
+## 5. 文本归一化与“源坐标”
+
+### 5.1 归一化规则
+
+与原 App 对齐，但把“缩进”从源文本中拿掉，放到排版块里：
+
+```dart
+const String kIdeographicSpace = '　';
+const String kEmptyChapterText = '当前章节无内容';
+
+NormalizedChapter normalizeChapter(String raw) {
+  var s = raw.isEmpty ? kEmptyChapterText : raw;
+
+  // 与原实现一致：换行及其两侧空白 -> 单个换行
+  s = s.replaceAll(RegExp(r'[\s　]*[\n\r]+[\s　]*'), '\n');
+
+  // 只对整章首尾 trim，绝不对每段单独 trim
+  s = s.replaceFirst(RegExp(r'^[\s　]+'), '');
+  s = s.replaceFirst(RegExp(r'[\s　]+$'), '');
+  if (s.isEmpty) s = kEmptyChapterText;
+
+  final paragraphs = s.split('\n');
+  final starts = <int>[];
+  final buf = StringBuffer();
+  var off = 0;
+  for (var i = 0; i < paragraphs.length; i++) {
+    starts.add(off);
+    buf.write(paragraphs[i]);
+    off += paragraphs[i].length;
+    if (i != paragraphs.length - 1) {
+      buf.write('\n');
+      off += 1;
+    }
+  }
+  return NormalizedChapter(
+    paragraphs: paragraphs,
+    sourceText: buf.toString(),
+    paragraphStarts: starts,
+  );
+}
+```
+
+注意：
+
+- 原 App 的替换模板是 `"\n" + U+3000 * headIndent`；这里先替换成 `"\n"`，缩进在构建块时加。**最终视觉效果等价，但源坐标不受 headIndent 影响**。
+- 不要把 `\s` 简化成 `[ \t]`；全角空格、制表符、`\r`、连续空行都要覆盖。
+- 不要对 `paragraphs[i]` 再 `trim()`。那会把“段落内部的尾随空格”和“下一段开头的缩进”处理掉，导致源偏移和视觉不一致。
+- `String.length`、`substring`、`TextPosition.offset` 都是 **UTF-16 code unit**，与 `NSRange` 一致。不要用 rune 数或 `characters` 包的长度做排版偏移。
+
+### 5.2 为什么锚点要用“源坐标”
+
+如果锚点用“加了缩进之后的展示文本偏移”，那么用户把 `headIndent` 从 2 改成 0，所有偏移都会平移，恢复位置就会错。
+
+因此定义：
+
+- `sourceText`：折叠空行、整章 trim 之后，段落用单个 `\n` 连接，**不含 U+3000 缩进**。
+- 展示块文本：`U+3000 * headIndent + paragraphs[i]`。
+- 块内偏移 → 源偏移：`sourceStart + (blockLocal - indentLen).clamp(0, paragraph.length)`。
+- 阅读进度只存 `sourceText` 上的偏移。
+
+这样字号、行距、段距、边距、单双栏、缩进变化时，文字锚点始终有效。
+
+### 5.3 标题与正文
+
+- 标题单独一个块，不进入 `sourceText`；标题页的锚点固定为 0。
+- 标题块样式使用 `title*` 参数。
+- 标题与正文第一段之间的间距使用正文 `paragraphSpacing`（原实现的换行符属于正文样式，这是最接近的行为）。
+- `backHeights != nil` 时原实现会在标题前加 `"\n\n"`。Flutter 版不要用空段落模拟，改为在整章流起始处加显式高度：
+  `topBlankHeight = 2 * (titleLineHeight + titleParagraphSpacing)`。
+  这样不会产生零长度行，也不会影响行区间算法。
+
+---
+
+## 6. 样式与度量映射
+
+这一节是 Flutter 复刻最容易出现“看起来能跑，但页数不稳定”的地方，必须严格按一个公式实现，并让测量与绘制共用同一个 `TextStyle` 对象。
+
+### 6.1 字号
+
+```dart
+final bodyFontSize = cfg.fontSize <= 0 ? 20.0 : cfg.fontSize;
+final titleFontSize = math.max(1.0, bodyFontSize + cfg.titleFontSizeOffset);
+```
+
+不要读取系统动态字号。原 App 使用显式 `fontSize`，不随系统辅助功能缩放。Flutter 里用 `TextScaler.noScaling`，或在构建配置时把用户字号乘进去，但分页快照必须固定。
+
+> 版本说明：`TextScaler` / `TextScaler.noScaling` 需要 Flutter 3.16+。更老的版本请用 `textScaleFactor: 1.0`，语义相同；同一工程内不要混用两套 API。
+
+### 6.2 lineSpacing → TextStyle.height
+
+CoreText 的 `NSParagraphStyle.lineSpacing` 语义是：**行与行之间额外增加这么多点**，行盒本身的高度由字体决定。
+
+Flutter 没有同名字段，最接近的映射是：
+
+```text
+naturalLineHeight = fontSize * naturalLineRatio   // 字体自然行高，构建期标定
+lineBoxHeight     = naturalLineHeight + lineSpacing
+heightMultiple    = lineBoxHeight / fontSize
+```
+
+然后：
+
+```dart
+final bodyStyle = TextStyle(
+  fontFamily: cfg.fontFamily,
+  fontSize: bodyFontSize,
+  height: (bodyFontSize * cfg.naturalLineRatio + cfg.lineSpacing) / bodyFontSize,
+  letterSpacing: cfg.wordSpacing == 0 ? null : cfg.wordSpacing,
+  fontWeight: _weightFromInt(cfg.fontWeight),
+  color: Colors.black,
+  // 关键：固定 leading 分布，避免不同平台对 half-leading 的处理不同
+);
+```
+
+并给 `TextPainter` 设置：
+
+```dart
+textHeightBehavior: const TextHeightBehavior(
+  applyHeightToFirstAscent: true,
+  applyHeightToLastDescent: true,
+  leadingDistribution: TextLeadingDistribution.even,
+),
+```
+
+说明：
+
+- `naturalLineRatio` 必须来自**自带字体**，并在构建期或首次启动时标定一次后写死/缓存。不同字体的自然行高不同（常见 1.15~1.35）。
+- 标定方法：用目标字体、目标字号、`height: null` 排一个单行 `"国"`，读 `TextPainter.computeLineMetrics().first.height / fontSize`。用同样的字体资源，这个值在不同设备上应当一致。
+- 必须设置 `height`。这样即使某个生僻字回退到 fallback 字体，行盒高度仍然是 `fontSize * height`，不会因为 fallback 字体的 ascent/descent 不同而改变整页行数。这是 Flutter 侧最重要的稳定性手段之一。
+- `leadingDistribution: even` 把额外 leading 平均分到行的上下。它和 CoreText 的 `lineSpacing` 在视觉上不完全相同（CoreText 只加在行之间），但页数计算是自洽的。若要和 CoreText 更接近，可以做下面的可选调整：
+  - 把 `applyHeightToFirstAscent` / `applyHeightToLastDescent` 设为 `false`，让首行上方和末行下方不吃 leading；
+  - 行位置以 `LineMetrics.baseline - LineMetrics.ascent` 为准，不要用“高度累加”推算；
+  - 用 golden 对比逐项校准。
+  默认建议先用 `true/true + even`，简单、稳定、可测。
+
+### 6.3 paragraphSpacing → 块间显式间距
+
+Flutter 的 `TextStyle`/`TextPainter` 没有 `paragraphSpacing`。不要试图用 `\n\n` 或空 span 模拟，那会引入空行、行高和页边界的不确定性。
+
+正确做法：
+
+- 每个源段落是一个独立的 `BlockLayout`；
+- 块与块之间增加 `paragraphSpacing` 像素的垂直间距；
+- 该间距参与“页容量”计算，但不绘制任何东西；
+- 页首如果正好落在某段第一行，段前间距在页框之上，被裁剪掉，不会在页顶留白；
+- 页尾如果放不下下一段第一行，直接断页，段前间距留在上一页页框之外，不会带到下一页。
+
+这等价于 CoreText 的段间距语义，而且完全可控。
+
+### 6.4 wordSpacing → letterSpacing
+
+```dart
+letterSpacing: cfg.wordSpacing == 0 ? null : cfg.wordSpacing
+```
+
+差异说明：
+
+- CoreText `NSKernAttributeName` 是字距调整；Flutter `letterSpacing` 会在字符之间加间距，某些版本也会在行尾字符后加。
+- 这可能导致同样的文本在两端的断行点略有不同，但**只要测量和绘制用同一个样式，Flutter 内部就是稳定的**。
+- 如果要求与 iOS 断行完全一致，需要自研排版/字距处理；这不属于“稳定性”目标，本文不展开。
+
+### 6.5 fontWeight
+
+原 App 的 `fontWeight` 实际是 `NSStrokeWidthAttributeName = -weight` 的伪粗体，不改变字形 advance，只描边加粗。
+
+Flutter 对应策略：
+
+- 首选：字体资源里自带多字重，用 `FontWeight` 选真实字重；
+- 次选：`foreground: Paint()..style = PaintingStyle.stroke..strokeWidth = ...` 叠一层描边；
+- 不要用系统合成粗体（不同平台合成算法不同，可能影响字形宽度/断行）。
+- 无论选哪种，测量和绘制必须用同一个 `TextStyle`。
+
+### 6.6 标题样式
+
+标题使用同一套映射，只是参数换成 `title*`：
+
+```dart
+final titleStyle = TextStyle(
+  fontFamily: cfg.fontFamily,
+  fontSize: titleFontSize,
+  height: (titleFontSize * cfg.naturalLineRatio + cfg.titleLineSpacing) / titleFontSize,
+  letterSpacing: cfg.titleWordSpacing == 0 ? null : cfg.titleWordSpacing,
+  fontWeight: _weightFromInt(cfg.titleFontWeight),
+  color: Colors.black,
+);
+```
+
+标题块高度、标题行高、标题段后间距都独立计算；正文块不受影响。
+
+### 6.7 字体、locale、断行
+
+```dart
+TextPainter(
+  text: TextSpan(text: blockText, style: style),
+  textAlign: TextAlign.justify,
+  textDirection: TextDirection.ltr,
+  textScaler: TextScaler.noScaling,
+  locale: const Locale('zh', 'CN'),
+  textWidthBasis: TextWidthBasis.parent,
+  textHeightBehavior: const TextHeightBehavior(
+    applyHeightToFirstAscent: true,
+    applyHeightToLastDescent: true,
+    leadingDistribution: TextLeadingDistribution.even,
+  ),
+  strutStyle: StrutStyle(
+    fontFamily: style.fontFamily,
+    fontSize: style.fontSize,
+    height: style.height,
+    forceStrutHeight: true,
+  ),
+)..layout(maxWidth: columnWidth);
+```
+
+要求：
+
+- **必须自带字体**（例如 Noto Serif SC / 思源宋体），并通过 `FontLoader` 或 `pubspec` 加载；分页前等待字体加载完成。字体没加载完就分页，会先用 fallback 字体，页数必然不同。
+- `fontFamilyFallback` 也要固定，且尽量包含所需字符；但仍以显式 `height` 保证行盒高度。
+- 固定 `locale` 为 `zh_CN`，让 ICU 使用中文断行/标点规则。Flutter 引擎版本升级可能改变 ICU 数据，因此布局签名里要带引擎版本；升级后强制重排。
+- 固定 `TextDirection.ltr`。如果书里混排 RTL 文本，行边界/字符范围会复杂化；本规范按中文 LTR 处理，RTL 需要额外设计。
+- `TextWidthBasis.parent` 保证每行宽度以 `maxWidth` 为准，而不是“最长行宽度”，否则页宽和绘制会对不上。
+- `forceStrutHeight: true` + 与 `TextStyle.height` 相同的 strut，可以进一步保证行高不受 fallback 字体影响。每个块只有一种样式，所以块级 strut 是安全的。
+
+---
+
+## 7. 分页算法
+
+### 7.1 构建块
+
+```dart
+class BlockInput {
+  final String text;
+  final int sourceStart;   // 标题为 -1
+  final int sourceEnd;     // 标题为 -1
+  final bool isTitle;
+  final double gapAfter;
+}
+
+List<BlockInput> buildBlocks(
+  NormalizedChapter ch,
+  PaibanConfig cfg,
+  String chapterTitle,
+  bool backwardMode,
+) {
+  final indent = kIdeographicSpace * cfg.headIndent;
+  final out = <BlockInput>[];
+
+  if (chapterTitle.isNotEmpty) {
+    out.add(BlockInput(
+      text: chapterTitle,
+      sourceStart: -1,
+      sourceEnd: -1,
+      isTitle: true,
+      gapAfter: cfg.paragraphSpacing, // 标题与正文第一段之间按正文段距
+    ));
+  }
+
+  for (var i = 0; i < ch.paragraphs.length; i++) {
+    out.add(BlockInput(
+      text: indent + ch.paragraphs[i], // 缩进只影响展示，不影响 source 偏移
+      sourceStart: ch.paragraphStarts[i],
+      sourceEnd: ch.paragraphStarts[i] + ch.paragraphs[i].length,
+      isTitle: false,
+      gapAfter: i == ch.paragraphs.length - 1 ? 0 : cfg.paragraphSpacing,
+    ));
+  }
+  return out;
+}
+```
+
+注意：
+
+- 标题不与正文拼成一个大字符串，避免标题/正文样式区间和段距混乱。
+- 每个正文段落单独处理，正好对应 CoreText 的“段落之间才有 paragraphSpacing”。
+- `gapAfter` 是“段后间距”，最后一篇不计算，避免章节末尾多出一大段空白。
+- `backwardMode` 的两个前导空行在流起始处加高度，不生成空块。
+
+### 7.2 块布局与行信息
+
+```dart
+BlockLayout layoutBlock(
+  BlockInput b,
+  TextStyle style,
+  double columnWidth,
+  int blockIndex,
+  int headIndent,
+) {
+  final tp = TextPainter(
+    text: TextSpan(text: b.text, style: style),
+    textAlign: TextAlign.justify,
+    textDirection: TextDirection.ltr,
+    textScaler: TextScaler.noScaling,
+    locale: const Locale('zh', 'CN'),
+    textWidthBasis: TextWidthBasis.parent,
+    textHeightBehavior: const TextHeightBehavior(
+      applyHeightToFirstAscent: true,
+      applyHeightToLastDescent: true,
+      leadingDistribution: TextLeadingDistribution.even,
+    ),
+    strutStyle: StrutStyle(
+      fontFamily: style.fontFamily,
+      fontSize: style.fontSize,
+      height: style.height,
+      forceStrutHeight: true,
+    ),
+  )..layout(maxWidth: columnWidth);
+
+  final metrics = tp.computeLineMetrics();
+  final lines = <LineInfo>[];
+  var local = 0;
+
+  for (var i = 0; i < metrics.length; i++) {
+    final m = metrics[i];
+    final r = tp.getLineBoundary(TextPosition(offset: local));
+    var lineStart = r.start;
+    var lineEnd = r.end;
+
+    // 防御：极端情况下 range 退化，至少推进一个 code unit
+    if (lineEnd <= lineStart) {
+      lineStart = local;
+      lineEnd = math.min(local + 1, b.text.length);
+    }
+
+    // 正常情况下 local 就是本行起点；如果不一致，用 range.start 修正
+    if (lineStart > local) lineStart = local;
+
+    final paraLen = b.sourceEnd - b.sourceStart;
+    final localStart = (lineStart - headIndent).clamp(0, paraLen).toInt();
+    final localEnd = (lineEnd - headIndent).clamp(0, paraLen).toInt();
+    final sourceStart = b.isTitle ? 0 : b.sourceStart + localStart;
+    final sourceEnd = b.isTitle ? 0 : b.sourceStart + localEnd;
+
+    lines.add(LineInfo(
+      blockIndex: blockIndex,
+      lineIndex: i,
+      blockCharStart: lineStart,
+      blockCharEnd: lineEnd,
+      sourceCharStart: sourceStart,
+      sourceCharEnd: sourceEnd,
+      topRel: m.baseline - m.ascent, // 用真实 baseline/ascent，不靠累加
+      height: m.height,
+    ));
+
+    local = lineEnd;
+    if (local >= b.text.length) break;
+  }
+
+  return BlockLayout(
+    painter: tp,
+    text: b.text,
+    indentLen: b.isTitle ? 0 : headIndent,
+    sourceStart: b.sourceStart,
+    sourceEnd: b.sourceEnd,
+    topAbs: 0, // 由流式组装填充
+    height: tp.height,
+    gapAfter: b.gapAfter,
+    lines: lines,
+  );
+}
+```
+
+关键点：
+
+- **行位置必须用 `metrics[i].baseline - metrics[i].ascent`**。不要用“前面所有行高累加”去推，因为 `TextStyle.height`、首末行 leading、float 舍入都可能让累加值和引擎真实位置差一点。
+- 行高用 `metrics[i].height`；块高用 `tp.height`。两者可能有极小的首末行差异，以 `tp.height` 为准安排块在流中的位置，以 `baseline - ascent` 安排行在块内的位置。
+- `getLineBoundary` 对中文 LTR、无硬换行的块是可靠的。实现后必须加一个测试：把块内所有行区间按顺序拼起来，应覆盖 `[0, text.length)`，否则改用 `getPositionForOffset` 做兜底。
+- 源偏移映射要把缩进长度减掉，并 clamp 到段落范围。缩进只影响展示，不影响锚点。
+- `tp` 只 layout 一次。之后只调用 `paint`，绝不再 `layout`。
+
+### 7.3 组装整章流
+
+```dart
+class FlowResult {
+  final List<BlockLayout> blocks;
+  final List<LineInfo> lines;
+}
+
+FlowResult buildFlow(
+  List<BlockInput> inputs,
+  PaibanConfig cfg,
+  PageGeometry geo,
+  bool backwardMode,
+) {
+  final blocks = <BlockLayout>[];
+  final allLines = <LineInfo>[];
+  var y = 0.0;
+
+  if (backwardMode && inputs.isNotEmpty && inputs.first.isTitle) {
+    final titleLineH = cfg.titleFontSize * cfg.naturalLineRatio + cfg.titleLineSpacing;
+    y += 2 * (titleLineH + cfg.titleParagraphSpacing);
+  }
+
+  for (var i = 0; i < inputs.length; i++) {
+    final b = inputs[i];
+    final style = b.isTitle ? titleStyleOf(cfg) : bodyStyleOf(cfg);
+    final layout = layoutBlock(b, style, geo.columnWidth, i, cfg.headIndent);
+    layout.topAbs = y;               // 需要 BlockLayout.topAbs 可写
+    for (final line in layout.lines) {
+      line.blockTopAbs = y;
+      allLines.add(line);
+    }
+    blocks.add(layout);
+    y += layout.height;
+    y += layout.gapAfter;
+  }
+  return FlowResult(blocks, allLines);
+}
+```
+
+注意：`gapAfter` 只影响下一块的 `topAbs`，不会被绘制。页首落到某块第一行时，块前间距在页框上方，自动被裁剪掉。
+
+### 7.4 按行装页
+
+```dart
+const double kEps = 1e-6;
+
+List<ColumnSlice> paginateColumns(
+  List<LineInfo> lines,
+  double pageHeight,
+) {
+  final cols = <ColumnSlice>[];
+  var i = 0;
+  while (i < lines.length) {
+    // 第一页从章节顶部 0 开始，这样 backwardMode 的标题前空白才会显示在页内；
+    // 后续页从本页第一行顶部开始，避免段距/空行被带到页顶。
+    final pageTop = (i == 0) ? 0.0 : lines[i].topAbs;
+    var j = i;
+    while (j < lines.length) {
+      final bottom = lines[j].topAbs + lines[j].height;
+      if (j > i && bottom - pageTop > pageHeight + kEps) break;
+      j++;
+    }
+    if (j == i) j = i + 1; // 单行本身高于页高：强制推进，保证不死循环
+
+    final first = lines[i];
+    final last = lines[j - 1];
+    final isTitleOnly = first.blockIndex == 0 && first.sourceCharStart == 0 &&
+        last.sourceCharEnd == 0;
+
+    cols.add(ColumnSlice(
+      topAbs: pageTop,
+      height: pageHeight,
+      firstLine: i,
+      lastLine: j,
+      sourceStart: isTitleOnly ? 0 : first.sourceCharStart,
+      sourceEnd: isTitleOnly ? 0 : last.sourceCharEnd,
+      isTitleOnly: isTitleOnly,
+    ));
+    i = j;
+  }
+  return cols;
+}
+```
+
+要点：
+
+- 页顶 = 本页第一行的 `topAbs`；不是上一页末尾 + 页高。这样段距落在页边界时，下一页不会多出顶部空白。
+- 判定条件是“当前行底部 − 页顶 > 页高”，允许恰好贴底（epsilon 内）。
+- 每页至少一行。即使这一行比页高还高，也强制包含并前进，避免死循环。
+- 页的字符范围取第一行/最后一行的源偏移。段落之间的 `\n` 不属于任何页，这是允许的；按字符找页时，落在 `\n` 上会归到下一页。
+
+### 7.5 双栏
+
+```dart
+List<ColumnSlice> columns = paginateColumns(allLines, geo.pageHeight);
+
+// 双栏时：
+// 物理页 k = columns[2k] + columns[2k+1]
+// 左栏 rect = Rect.fromLTWH(l, t, halfW, pageHeight)
+// 右栏 rect = Rect.fromLTWH(screenW*0.5 + l, t, halfW, pageHeight)
+```
+
+注意：
+
+- 双栏必须先按半栏宽重新 `layout` 每个块，不能拿单栏结果横向切。
+- 两栏是阅读顺序上的连续页；字符范围自然连续。
+- 最后一页只有左栏时，右栏留空。
+- 物理页索引 = 栏索引 ~/ 2；栏索引 = 物理页索引 * 2 + (0 左 / 1 右)。
+
+### 7.6 空文本与极端输入
+
+- 空章节：归一化后替换为固定常量 `当前章节无内容`，仍然走正常块布局，保证至少一页。
+- 超长无换行段落：一个块可能有很多行，`TextPainter` 能处理；分页仍按行装页。绘制时该块会跨越很多页，但每页只画当前页的裁剪区域。
+- 超窄页宽：宽度下限 `max(width, 100)`，与 App 一致；否则可能出现每行一个字符甚至除零/负宽度。
+- 超大段距：段距只影响下一块 `topAbs`，不会生成空白页；页首从行顶开始。
+- 连续空行：归一化已经折叠成一个换行，不会产生空块。
+- 标题为空：跳过标题块，只排正文。
+- 标题超长占满整页：标题块可能跨页；这是允许的，行区间算法不区分标题/正文。
+
+---
+
+## 8. 绘制
+
+### 8.1 绘制原则
+
+- **不要用 `Text` / `RichText` widget 来画正文**：它们会受 `MediaQuery.textScaler`、父级约束、自动换行等影响，且无法保证和分页使用同一个 layout。
+- 用 `CustomPainter` + 已经 layout 好的 `TextPainter`。
+- 每页只绘制与该页相交的块；块内所有行都画，靠 `clipRect` 裁剪。因为每块是一个段落，通常一个块只有几行到几十行，性能可以接受。
+- 绝不为了“只画本页几行”而对块重新 `layout` 或截取 substring。
+
+### 8.2 绘制代码
+
+```dart
+void paintColumn(
+  Canvas canvas,
+  Rect columnRect,
+  ChapterLayout layout,
+  ColumnSlice col,
+) {
+  canvas.save();
+  canvas.clipRect(columnRect);
+
+  final pageTop = col.topAbs;
+
+  for (final block in layout.blocks) {
+    // 块与当前页无交集则跳过（注意块高不含 gapAfter）
+    final blockBottom = block.topAbs + block.height;
+    if (blockBottom < pageTop - kEps) continue;
+    if (block.topAbs > pageTop + col.height + kEps) break; // blocks 按 topAbs 递增
+
+    canvas.save();
+    // 把“块顶部”对齐到它在当前页中的位置
+    final dy = columnRect.top + (block.topAbs - pageTop);
+    canvas.translate(columnRect.left, dy);
+    block.painter.paint(canvas, Offset.zero);
+    canvas.restore();
+  }
+
+  canvas.restore();
+}
+```
+
+坐标推导：
+
+- `columnRect` 是当前栏在屏幕上的矩形（左栏或右栏）。
+- 当前页第一行的绝对 y 是 `pageTop`。
+- 块顶部相对当前页的偏移是 `block.topAbs - pageTop`。
+- 所以块要平移 `columnRect.top + (block.topAbs - pageTop)`，使其顶部落在屏幕上的正确位置。
+- 块中在本页之前的行会落在 `columnRect.top` 之上，被 `clipRect` 裁掉；本页之后的行落在 `columnRect.bottom` 之下，也被裁掉。
+
+### 8.3 为什么这样能保证“排版=绘制”
+
+- 分页用的行位置是 `block.topAbs + (baseline - ascent)`；
+- 绘制时块顶部相对当前页的偏移是 `block.topAbs - pageTop`，屏幕平移量是 `columnRect.top + (block.topAbs - pageTop)`；
+- 两者使用同一组 `topAbs` 和同一份 `TextPainter`；
+- 因此“某一行是否落在 `[pageTop, pageTop+pageHeight]`”在分页和绘制中完全一致。
+
+这就是 I5 的实现方式。
+
+### 8.4 可选的性能优化
+
+如果某个段落特别长（例如整章只有一个段落，跨度几十页），每页都绘制整个块会让 Skia 处理大量不可见字形。优化方式：
+
+1. 仅对“超长块”按行边界切成多个绘制 chunk；
+2. 每个 chunk 仍从同一个整块 `TextPainter` 的 `layout` 结果取行位置，只是用 `canvas.clipRect` 进一步收窄，不重新 layout；
+3. 如果必须重新 layout chunk，必须保证 chunk 起点是行边界，并接受页尾 justify 的轻微差异；这是降级方案，默认不用。
+
+更简单的做法是：阅读页通常段落不会特别长，先按块绘制，实测性能不足再优化。
+
+---
+
+## 9. 缓存、布局签名与并发
+
+### 9.1 布局签名
+
+任何一次分页都必须携带一个签名；签名相同才允许复用缓存。
+
+```dart
+String layoutSignature({
+  required String bookKey,
+  required String chapterId,
+  required String sourceText,
+  required String chapterTitle,
+  required PaibanConfig cfg,
+  required PageGeometry geo,
+  required bool doubleColumn,
+  required bool backwardMode,
+}) {
+  final payload = {
+    'layoutVersion': kLayoutVersion,          // 手动递增，排版逻辑变更时 +1
+    'engine': kFlutterEngineVersion,          // Flutter/Impeller/Skia 版本
+    'fontAsset': kFontAssetId,                // 字体资源 id/哈希
+    'book': bookKey,
+    'chapter': chapterId,
+    'textHash': sha256Hex(sourceText),
+    'title': chapterTitle,
+    'fontSize': cfg.fontSize,
+    'lineSpacing': cfg.lineSpacing,
+    'paragraphSpacing': cfg.paragraphSpacing,
+    'wordSpacing': cfg.wordSpacing,
+    'fontWeight': cfg.fontWeight,
+    'headIndent': cfg.headIndent,
+    'titleFontSizeOffset': cfg.titleFontSizeOffset,
+    'titleLineSpacing': cfg.titleLineSpacing,
+    'titleParagraphSpacing': cfg.titleParagraphSpacing,
+    'titleWordSpacing': cfg.titleWordSpacing,
+    'titleFontWeight': cfg.titleFontWeight,
+    'margins': [cfg.margins.left, cfg.margins.top,
+                cfg.margins.right, cfg.margins.bottom],
+    'bottomSlack': cfg.bottomSlack,
+    'columnWidth': geo.columnWidth,
+    'pageHeight': geo.pageHeight,
+    'doubleColumn': doubleColumn,
+    'backwardMode': backwardMode,
+  };
+  return sha256Hex(jsonEncode(payload));
+}
+```
+
+必须包含：
+
+- 所有可能影响断行的数值，包括 `headIndent`（它改变展示文本和行宽）；
+- 标题文本/样式；
+- 字体资源标识；
+- 引擎版本/排版版本；
+- 页宽、页高、单双栏；
+- 源文本哈希。
+
+不需要包含：
+
+- 当前时间；
+- 用户阅读的页码/位置；
+- 与排版无关的 UI 状态（主题色等）。
+
+### 9.2 缓存粒度
+
+- 内存：`Map<String, ChapterLayout>`，按签名做 key，LRU 保留 3~8 章。
+- 可选持久化：只保存“页的字符范围 + 签名”，不要保存 `TextPainter`（native 对象不能序列化，也不能跨进程恢复）。
+- 持久化缓存读取时必须校验签名；签名不匹配直接丢弃并重排。**宁可重排，不要用可能过期的页范围。**
+- 淘汰时调用 `TextPainter.dispose()`（如果当前 Flutter 版本提供），释放 native 资源。
+
+### 9.3 单飞与过期结果丢弃
+
+```dart
+int _layoutEpoch = 0;
+final Map<String, Future<ChapterLayout>> _inFlight = {};
+
+Future<ChapterLayout> paginateSingleFlight(
+  String signature,
+  Future<ChapterLayout> Function() build,
+) {
+  final existing = _inFlight[signature];
+  if (existing != null) return existing;
+
+  final epoch = ++_layoutEpoch;
+  final future = build().then((layout) {
+    if (epoch != _layoutEpoch) {
+      // 本次结果已过期，丢弃
+      throw const StaleLayoutException();
+    }
+    return layout;
+  }).whenComplete(() => _inFlight.remove(signature));
+
+  _inFlight[signature] = future;
+  return future;
+}
+```
+
+注意：
+
+- 更细粒度的做法是“每个 (book, chapter) 一个 epoch”，而不是全局 epoch；否则切章会误伤仍需要的预排版。
+- UI 层收到结果时再校验一次 `layout.signature == currentSignature`。
+- 快速切章、快速拖动字号时，旧任务的结果必须**静默丢弃**，不能写入当前页。
+
+### 9.4 在哪个 isolate 排版
+
+Flutter 的 `dart:ui` / `TextPainter` 依赖引擎，通常只能在 UI isolate（root isolate）使用。**不要用 `Isolate.run` / `compute` 去调用 `TextPainter`**，否则会报错或行为不确定。
+
+推荐：
+
+1. 当前章：在 UI isolate 分页，按块分片，避免单帧卡顿：
+   ```dart
+   for (var i = 0; i < blocks.length; i += chunk) {
+     layoutBlocks(i .. i+chunk);
+     await SchedulerBinding.instance.endOfFrame; // 或 await Future<void>.delayed(Duration.zero)
+     if (epoch != _layoutEpoch) throw const StaleLayoutException();
+   }
+   ```
+2. 下一章：在当前页稳定后的空闲帧预排版，结果进入缓存；不要和当前章抢同一帧。
+3. 如果确实需要后台线程，只能自己实现纯 Dart 的断行/度量（例如基于 ICU 数据或第三方断行库），然后自绘；这属于另一套方案，本文不展开，也不建议在没有明确性能瓶颈时采用。
+
+### 9.5 字体加载门禁
+
+分页前必须确保：
+
+```dart
+await fontLoader.load();          // 自带字体
+await SchedulerBinding.instance.endOfFrame; // 确保字体真正可用于排版
+```
+
+否则第一次分页可能使用 fallback 字体，页数与字体加载后的结果不同。建议在 App 启动时预加载，并用一个全局 `fontsReady` Future 作为阅读页的入口门禁。
+
+---
+
+## 10. 阅读进度锚点
+
+### 10.1 保存
+
+```dart
+ReadingAnchor anchorOf(ColumnSlice col, ChapterLayout layout) {
+  final first = layout.lines[col.firstLine];
+  return ReadingAnchor(
+    chapterIndex: currentChapterIndex,
+    sourceOffset: col.sourceStart,
+    fraction: layout.sourceText.isEmpty
+        ? 0
+        : col.sourceStart / layout.sourceText.length,
+  );
+}
+```
+
+- 保存 `sourceOffset`，不是 `pageIndex`。
+- 如果当前页是标题页（`isTitleOnly`），`sourceOffset = 0`。
+- 额外保存 `fraction`，用于章节文本被更新、偏移越界时的兜底。
+
+### 10.2 恢复
+
+```dart
+int columnForOffset(List<ColumnSlice> cols, int offset) {
+  var lo = 0, hi = cols.length;
+  while (lo < hi) {
+    final mid = (lo + hi) >> 1;
+    if (cols[mid].sourceEnd > offset) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return lo < cols.length ? lo : cols.length - 1;
+}
+```
+
+- 找“第一个 sourceEnd > offset 的栏”。
+- 如果 offset 正好落在段落之间的 `\n` 上，它会落到下一栏（因为上一栏 end 不包含换行）。
+- 恢复后，物理页 = 栏索引 ~/ 2，左右栏 = 栏索引 % 2。
+- 如果 `offset` 超出当前 `sourceText.length`，用 `fraction * length` 夹取。
+
+### 10.3 为什么必须这样
+
+反例：
+
+- 用户在第 10 页，把字号从 20 调到 24，整章页数从 100 变成 140。如果保存的是“第 10 页”，恢复后会跳到完全不同的内容。
+- 保存 `sourceOffset` 后，重排再映射，仍然回到同一句话。
+
+这是 I8 的落地方式，也是“稳定性”对用户最直观的体现。
+
+---
+
+## 11. 稳定性陷阱清单
+
+按优先级排列，每一条都应该在 code review 时检查。
+
+1. **系统字体缩放**
+   - 不要用 `MediaQuery.textScalerOf(context)` 隐式缩放正文。
+   - `TextPainter` 显式传 `TextScaler.noScaling`；用户字号只通过 `PaibanConfig.fontSize` 进入。
+2. **字体未加载完就分页**
+   - 必须先 `await` 字体加载，再分页；否则页数会变。
+3. **fallback 字体改变行高**
+   - 必须给 `TextStyle.height` 赋明确值；行盒高度 = `fontSize * height`，不随 fallback 字体 metrics 变化。
+   - `fontFamilyFallback` 固定，字体资源自带。
+4. **分页和绘制用了不同的宽度/高度**
+   - 统一使用 `PageGeometry.columnWidth` / `pageHeight`。
+   - 原 App 的 `-20` 安全余量只能减一次；不要分页减 20、绘制减 30。
+5. **分页和绘制用了不同的 TextStyle 实例/参数**
+   - 把 `bodyStyleOf(cfg)` / `titleStyleOf(cfg)` 做成纯函数，同一个 cfg 返回相同参数；测量和绘制复用同一个 `TextStyle` 对象。
+6. **每页重新 layout**
+   - 不要对页 substring 重新 layout；页只是行区间。
+7. **用累加行高推进行位置**
+   - 用 `baseline - ascent` 和 `tp.height`；不要用 `sum(line.height)` 代替块高，也不要用 `index * lineHeight`。
+8. **对每段单独 trim**
+   - 缩进是 U+3000 字符，单独 trim 会把它删掉，导致行宽/页数变化。
+9. **先加缩进再 trim**
+   - 必须先对整章 trim，再在块构建时加缩进。顺序反了，首段缩进会丢。
+10. **用空段落/`\n\n` 模拟段距**
+    - 会产生零长度行或额外行高；用块间显式 `paragraphSpacing`。
+11. **页首带上了上一页的段距**
+    - 页顶必须取本页第一行的 `topAbs`，不要取“上一页底部 + 页高”。
+12. **死循环**
+    - 每页至少一行；如果 `visibleRange`/行区间为空，强制推进 1 个 code unit 或 1 行。
+13. **UTF-16 与 rune 混用**
+    - 所有 offset 用 UTF-16 code unit；不要用 `String.runes.length`、`characters.length` 作为排版偏移。
+14. **emoji/代理对**
+    - 行边界不会拆代理对；但如果你自己做字符级兜底，必须检查 `codeUnitAt` 不是低位代理。
+15. **小数舍入**
+    - 页高、行高、top 全部用 `double`；不要 `toInt()` 后再比较。比较时用 `1e-6` 级别 epsilon。
+16. **安全区/键盘/导航栏变化**
+    - 页框尺寸变化 = 布局签名变化 = 重新分页；不要在一章中途悄悄改 `pageHeight`。
+17. **旋转过程中用旧尺寸分页**
+    - 以“本次 layout 实际使用的尺寸”生成签名；旋转后旧结果直接丢弃。
+18. **双栏按单栏结果横切**
+    - 必须用半栏宽重新 layout。
+19. **缓存没有签名**
+    - 任何排版参数、字体、引擎版本变化都必须使缓存失效。
+20. **并发结果覆盖**
+    - 用 epoch/签名校验，旧任务结果不能写入当前 UI。
+21. **把页码持久化当唯一进度**
+    - 必须存源字符偏移；页码只是派生值。
+22. **locale 不固定**
+    - 中文断行/标点规则依赖 locale；固定 `zh_CN`，并把引擎版本纳入签名。
+23. **`TextWidthBasis.longestLine`**
+    - 会导致 `TextPainter.width` 不等于页宽；统一用 `parent`。
+24. **绘制时重新计算排版参数**
+    - 绘制只能读 `ChapterLayout`，不能重新读设置、重新算样式。
+
+---
+
+## 12. 验收测试
+
+另一个 AI 实现完后，必须让下面这些测试全部通过。测试不需要真实 UI，只要能构造 `PaibanConfig`、`PageGeometry`、文本即可。
+
+### 12.1 分页确定性
+
+```dart
+test('same input -> identical layout', () {
+  final a = paginate(text, title, cfg, geo);
+  final b = paginate(text, title, cfg, geo);
+  expect(a.columns.length, b.columns.length);
+  for (var i = 0; i < a.columns.length; i++) {
+    expect(a.columns[i].sourceStart, b.columns[i].sourceStart);
+    expect(a.columns[i].sourceEnd, b.columns[i].sourceEnd);
+    expect(a.columns[i].firstLine, b.columns[i].firstLine);
+    expect(a.columns[i].lastLine, b.columns[i].lastLine);
+  }
+});
+```
+
+### 12.2 页范围连续、无重叠
+
+对正文所有非换行字符：
+
+- 每个字符恰好属于一栏；
+- 上一栏 `sourceEnd <= 下一栏 sourceStart`；
+- 段落分隔符 `\n` 不属于任何栏，允许出现 1 个 code unit 的空隙；
+- 所有栏按顺序拼起来，不允许出现负向跳变。
+
+### 12.3 页容量
+
+```dart
+for (final col in layout.columns) {
+  final first = layout.lines[col.firstLine];
+  final last = layout.lines[col.lastLine - 1];
+  final used = (last.topAbs + last.height) - col.topAbs;
+  expect(used, lessThanOrEqualTo(geo.pageHeight + 1e-6));
+}
+```
+
+允许的唯一例外：`col.lastLine - col.firstLine == 1` 且单行高度 > 页高。
+
+### 12.4 排版/绘制同源
+
+对每一栏：
+
+- 枚举所有 `line.topAbs < col.topAbs + pageHeight` 且 `line.topAbs + line.height > col.topAbs` 的行；
+- 这些行必须恰好等于 `[col.firstLine, col.lastLine)`；
+- 不能多一行，不能少一行。
+
+这个测试直接验证 I5，是防止“分页一套、绘制一套”的关键。
+
+### 12.5 锚点往返
+
+对随机/边界 offset（0、每段开头、页边界、最后一段末尾）：
+
+```dart
+final col = columnForOffset(layout.columns, offset);
+expect(layout.columns[col].sourceEnd, greaterThan(offset));
+```
+
+并且：
+
+- 重新用不同 `fontSize` 分页；
+- 用同一个 `offset` 找回；
+- 该栏范围内的文本（去掉缩进后）应包含原 offset 所在的字符。
+
+### 12.6 设置矩阵
+
+对以下维度做笛卡尔积，每个组合都跑 12.2 / 12.3 / 12.4：
+
+| 维度 | 取值 |
+|---|---|
+| fontSize | 12, 16, 20, 24, 32 |
+| lineSpacing | 0, 2, 8, 20 |
+| paragraphSpacing | 0, 4, 16, 40 |
+| wordSpacing | 0, 0.5, 2 |
+| headIndent | 0, 1, 2, 4 |
+| margins | 小/中/大 |
+| 单双栏 | false / true |
+| 屏幕 | 竖屏/横屏，小屏/大屏 |
+
+不要求不同组合之间页数相同，只要求每个组合内部满足不变量。
+
+### 12.7 旋转/双栏
+
+- 单栏竖屏 → 横屏：重新分页，锚点保持；页数可变。
+- 单栏 → 双栏：按半栏宽重排；栏数应为双栏分页结果，物理页 = `ceil(栏数/2)`。
+- 双栏最后一页只有左栏时，右栏为空，不崩溃、不重复字符。
+- 双栏关闭后，锚点仍能恢复。
+
+### 12.8 极端输入
+
+| 输入 | 期望 |
+|---|---|
+| 空字符串 | 一页，显示 `当前章节无内容` |
+| 只有 `\n\n\n` | 一页，显示占位文本，不产生空块 |
+| 连续 100 个空行 | 归一化后折叠，块数不爆炸 |
+| 单段 10 万字 | 分页终止，页数有限，内存可接受 |
+| 超窄页宽（<100） | 宽度夹到 100，仍终止 |
+| 段距 > 页高 | 不产生零行页，不丢字 |
+| 标题超长 | 标题块可跨页，页范围连续 |
+| emoji / 生僻字 | 行框不崩，字符范围不拆代理对 |
+
+### 12.9 字体/引擎变更
+
+- 换字体资源、升级 Flutter 引擎、升级 Impeller/Skia 后，`kLayoutVersion`/`engine` 签名变化，旧缓存全部失效；
+- 重新分页后 12.2 / 12.3 / 12.4 仍通过；
+- golden 截图允许变化，但页数和字符范围必须可重复（同一构建内）。
+
+### 12.10 并发
+
+- 连续发起两次不同签名（例如字号 20 → 24）的分页；
+- 先返回的旧结果必须被丢弃；
+- 最终 UI 只显示最后一次签名对应的布局；
+- 快速切章 10 次，不出现旧章节内容闪现。
+
+---
+
+## 13. 模块划分与实现顺序
+
+建议目录：
+
+```text
+lib/reader/layout/
+  paiban_config.dart        // PaibanConfig, 默认值, 样式纯函数
+  page_geometry.dart        // 边距、页宽、页高、单双栏
+  text_normalizer.dart      // normalizeChapter, sourceText
+  block_builder.dart        // buildBlocks
+  block_layout.dart         // TextPainter 布局, LineInfo
+  chapter_paginator.dart    // buildFlow, paginateColumns, ChapterLayout
+  layout_signature.dart     // 签名
+  layout_cache.dart         // LRU + 单飞 + epoch
+  reading_anchor.dart       // 锚点与 charOffset -> column
+  page_painter.dart         // CustomPainter, clip + translate + paint
+lib/reader/page/
+  reader_page_view.dart     // 串联：取文本 -> 归一化 -> 分页 -> 绘制
+  reader_settings.dart      // 生成 PaibanConfig 快照
+test/reader/
+  pagination_test.dart
+  anchor_test.dart
+  golden_test.dart
+```
+
+实现顺序（每一步都可独立测试）：
+
+1. `PaibanConfig` + `PageGeometry`：把边距、页宽、页高、单双栏算对，写单元测试对照本文公式。
+2. `normalizeChapter`：测试空行折叠、整章 trim、段落切分、source 偏移。
+3. `layoutBlock`：单段文本，验证行数、行高、`baseline - ascent`、行字符范围覆盖。
+4. `buildFlow`：多段 + 段距，验证块 `topAbs` 和段距不进入绘制。
+5. `paginateColumns`：验证容量、连续、单行超高、空文本。
+6. `page_painter`：先画单页，再验证“可见行集合 = 分页行集合”。
+7. 双栏：同一套算法，宽度换成半栏宽，验证配对。
+8. 锚点：验证设置变化后的恢复。
+9. 缓存/并发：签名、单飞、epoch。
+10. 性能：长章节分片布局，确保不掉帧。
+
+---
+
+## 附录 A：原 App 关键公式与常量速查
+
+| 项 | 原实现 | Flutter 对应 |
+|---|---|---|
+| 正文字号 | `tr_fontSize`，默认 20 | `PaibanConfig.fontSize` |
+| 标题字号 | 正文字号 + `titleFontSizeOffset` | 同左 |
+| 行距 | `NSParagraphStyle.lineSpacing` | `TextStyle.height = (fontSize*naturalLineRatio + lineSpacing)/fontSize` |
+| 段距 | `NSParagraphStyle.paragraphSpacing` | 块间显式 `paragraphSpacing` px |
+| 字距 | `NSKernAttributeName` | `TextStyle.letterSpacing` |
+| 字重 | `NSStrokeWidthAttributeName = -weight` 伪粗体 | 自带字重或 stroke 叠加 |
+| 对齐 | `alignment = 3` justified | `TextAlign.justify` |
+| 换行 | `lineBreakMode = 0` word wrap | 默认换行（固定 locale） |
+| 缩进 | `"\n" + U+3000 * headIndent` 文本 | 块文本前缀 `U+3000 * headIndent` |
+| 页宽（单栏） | `max(screenW - l - r, 100)` | 同左 |
+| 页宽（双栏） | `max(screenW*0.5 - l - r, 100)` | 同左 |
+| 页高 | `max(screenH - t - b, 100)`，分页再减 20 | `pageHeight = max(textViewH - bottomSlack, 100)` |
+| 双栏判断 | iPad && 横屏 && `tr_iPadDoubleCol` | 配置项 |
+| 分页切分 | `CTFramesetterCreateFrame` + `CTFrameGetVisibleStringRange` | 行区间装页 |
+| 页高补偿 | `lineSpacing*1.25` / `paraSpacing*1.65` / `max(..., h*0.3)` | **仅元数据，不参与断页** |
+| 标题前空行 | `backHeights != nil` 时 `"\n\n"` | 流起始显式 `2*(titleLineHeight+titleParagraphSpacing)` |
+| 进度 | `cpIndex + page + progress + usePageIndex` | `sourceOffset` + `fraction` |
+
+原实现关键地址（追溯用）：
+
+| 功能 | 地址 |
+|---|---|
+| `divisionResponse:cpTitle:cpIndex:` | `0x1000abf1c` |
+| `contentRectByScreenSize:left:` | `0x1000b1cf0` |
+| `doubleCol:` | `0x1000b16ac` |
+| `PaibanManager contentAttributes:paibanInfo:` | `0x100055724` |
+| `PaibanManager divisionText:...` 真实实现 | `0x100055bfc` |
+| `onDivisionTextFinish:cpIndex:` | `0x1000d8870` |
+| `TextReadTV resetFrameRef` | `0x10005b5d4` |
+| `TextReadTV drawRect:` | `0x10005bed0` |
+
+---
+
+## 附录 B：完整伪代码（按调用顺序）
+
+```text
+// 1. 设置快照
+cfg = PaibanConfig(
+    fontSize, lineSpacing, paragraphSpacing, wordSpacing, fontWeight,
+    headIndent, title*, margins, doubleColumn, bottomSlack=20,
+    fontFamily=自带字体, naturalLineRatio=构建期标定值)
+
+// 2. 页面几何
+l,r,t,b = cfg.margins
+if cfg.doubleColumn:
+    colW = max(screenW*0.5 - l - r, 100)
+    pageH = max(textViewH - cfg.bottomSlack, 100)
+    // 左栏 x=l；右栏 x=screenW*0.5+l
+else:
+    colW = max(screenW - l - r, 100)
+    pageH = max(textViewH - cfg.bottomSlack, 100)
+
+// 3. 文本归一化
+norm = normalizeChapter(rawText)
+// norm.paragraphs 不含缩进；norm.sourceText = paragraphs.join('\n')
+
+// 4. 构建块
+inputs = []
+if title non-empty:
+    inputs.add(titleBlock(title, gapAfter=cfg.paragraphSpacing))
+for each para in norm.paragraphs:
+    inputs.add(bodyBlock(text=U+3000*headIndent + para,
+                         sourceStart=..., sourceEnd=...,
+                         gapAfter=cfg.paragraphSpacing))
+
+// 5. 逐块 layout（每块只做一次）
+y = backwardMode ? 2*(titleLineH+titleParaSpacing) : 0
+allLines = []
+for each input in inputs:
+    style = input.isTitle ? titleStyle(cfg) : bodyStyle(cfg)
+    tp = TextPainter(... cfg, strut, no scaling, zh_CN, justify ...)
+         ..layout(maxWidth=colW)
+    lines = []
+    local = 0
+    for m in tp.computeLineMetrics():
+        r = tp.getLineBoundary(local)
+        lineStart, lineEnd = r.start, r.end
+        if lineEnd <= lineStart: lineEnd = min(local+1, text.length)
+        lines.add(LineInfo(
+            blockCharStart=lineStart, blockCharEnd=lineEnd,
+            sourceStart=mapSource(lineStart), sourceEnd=mapSource(lineEnd),
+            topRel=m.baseline - m.ascent, height=m.height))
+        local = lineEnd
+    block = BlockLayout(tp, topAbs=y, height=tp.height, lines)
+    allLines += lines
+    y += tp.height + input.gapAfter
+
+// 6. 装页（单栏）
+cols = []
+i = 0
+while i < allLines.length:
+    pageTop = (i == 0) ? 0.0 : allLines[i].topAbs
+    j = i
+    while j < allLines.length:
+        bottom = allLines[j].topAbs + allLines[j].height
+        if j > i and bottom - pageTop > pageH + eps: break
+        j++
+    if j == i: j = i + 1
+    cols.add(ColumnSlice(topAbs=pageTop, height=pageH,
+                         firstLine=i, lastLine=j,
+                         sourceStart=allLines[i].sourceStart,
+                         sourceEnd=allLines[j-1].sourceEnd))
+    i = j
+
+// 7. 双栏
+// cols 已经是按半栏宽分出的“栏”；物理页 = (cols[2k], cols[2k+1])
+
+// 8. 绘制
+for each block intersecting current col:
+    canvas.save()
+    canvas.clipRect(colRect)
+    dy = colRect.top + (block.topAbs - col.topAbs)
+    canvas.translate(colRect.left, dy)
+    block.painter.paint(canvas, Offset.zero)
+    canvas.restore()
+
+// 9. 进度
+sourceOffset = currentCol.sourceStart
+column = first col with sourceEnd > sourceOffset
+```
+
+---
+
+## 附录 C：一句话检查表
+
+实现完成后，用下面 8 个问题自检：
+
+1. 同一份文本、同一组参数，连排两次，页数/页边界是否完全一致？
+2. 绘制时显示的行，是否就是分页时算给该页的行？
+3. 改字号/旋转/切双栏后，是否还停在原来的文字位置？
+4. 页与页之间是否不丢字、不重字？
+5. 每页是否至少一行，循环是否一定终止？
+6. 段距落在页边界时，下一页顶部是否没有多余空白？
+7. 字体未加载完、fallback 字体、系统字号缩放，是否都不会改变行盒高度？
+8. 快速切章/连续改设置时，旧排版结果是否会被丢弃？
+
+如果 1~8 全部为“是”，这套 Flutter 实现就达到了原 App“稳定性”的核心目标，并且比原实现更容易测试、更容易跨设备复现。
