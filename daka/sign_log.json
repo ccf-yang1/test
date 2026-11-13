@@ -1,0 +1,13 @@
+[
+  {
+    "platform": "qoder",
+    "success": false,
+    "message": "缺少 accessToken",
+    "alreadyCheckedIn": false,
+    "credentialInvalid": false,
+    "credit": 0,
+    "trigger": "manual",
+    "created_at": 1794217601742,
+    "date": "2026-11-09"
+  }
+]

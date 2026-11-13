@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "签到自测",
+  "version": "1.4.0",
+  "description": "PoW 验证码 + 签到链路自测",
+  "minimum_chrome_version": "111",
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "tabs",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+       "https://testtesttest.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "签到自测",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+            "https://testtesttest.com/*"
+      ],
+      "js": [
+        "hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
+}

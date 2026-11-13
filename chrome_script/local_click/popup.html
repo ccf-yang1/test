@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="hd">
+    <span class="t">签到自测</span>
+    <span class="site" id="site">检查中…</span>
+  </div>
+
+  <div class="bd" id="log">
+    <div class="dim">点下方按钮开始：读取余额 → 过验证码 → 签到 → 回读余额。</div>
+  </div>
+
+  <div class="auth" id="auth" hidden>
+    <div class="tip">未登录或凭证已失效<span id="code"></span>，请先完成认证。</div>
+    <button id="open">打开站点登录</button>
+  </div>
+
+  <div class="auto">
+    <label class="row">
+      <input type="checkbox" id="auto">
+      <span id="autoLabel">每天自动签到</span>
+    </label>
+    <div class="hint" id="autoInfo">读取中…</div>
+  </div>
+
+  <div class="ft">
+    <button id="go">开始完整签到</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

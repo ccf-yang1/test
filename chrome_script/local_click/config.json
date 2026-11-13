@@ -1,0 +1,22 @@
+{
+  "_readme": "改域名只需要动这里 + manifest.json 的 matches/host_permissions",
+  "baseUrl":     "https://testtesttest.com",
+  "endpoints": {
+    "challenge": "/api/v1/public/captcha/challenge",
+    "redeem": "/api/v1/public/captcha/redeem",
+    "checkin": "/api/v1/users/wallet/checkin",
+    "wallet": "/api/v1/users/wallet"
+  },
+  "assets": {
+    "wasm": "/captcha/cap_wasm_bg.wasm",
+    "glue": "/captcha/cap_wasm.js"
+  },
+  "auth": {
+    "header": "",
+    "value": ""
+  },
+  "autoCheckin": {
+    "start": "11:00",
+    "windowMinutes": 30
+  }
+}
