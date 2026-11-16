@@ -18,7 +18,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 M32 = 0xFFFFFFFF
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_BASE_URL = "https://localhost:9998"
+DEFAULT_BASE_URL = "https://monkeycode-ai.com"
 USER_FILE = "userinfo.json"
 STATE_FILE = "auto_state.json"
 LOG_FILE = "auto_checkin.log"
