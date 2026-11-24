@@ -10,3 +10,7 @@ AdBlockConfig_FRAMEWORKS = UIKit Foundation WebKit
 AdBlockConfig_CFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+.PHONY: dylib
+dylib:
+	bash ./build-dylib.sh

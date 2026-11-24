@@ -5,15 +5,15 @@
 // 设计目标：
 //   1. App 启动即生效；
 //   2. 黑名单模式 / 白名单模式；
-//   3. 观察者模式：只记录域名，不拦截；
+//   3. 观察者模式：只记录请求，不拦截；
 //   4. 关网开关：临时阻断当前 App 所有 http/https 请求，用于判断广告是否来自远端；
 //   5. 启动后 30 秒内三指双击打开设置（覆盖较长的开屏广告）；
 //   6. 配置本地保存，重启 App 后从启动阶段开始拦截。
 //
 // 说明：
-//   - 本文件是 Logos/Tweak 源码，需要 Theos 或兼容的 Logos 构建环境；
+//   - 本文件是 Objective-C 注入源码，可用 Theos 或 clang 直接编成 dylib；
 //   - 只处理 http/https，不处理 file/data/about 等本地 URL；
-//   - 只记录域名，不记录完整 URL 和查询参数。
+//   - 日志记录域名和路径，不记录查询参数。
 //
 // 已知边界：
 //   - WKWebView 的子资源请求可能发生在独立进程，URL hook 不一定能覆盖；
@@ -115,7 +115,11 @@ static NSString *ABHostFromURLString(NSString *s)
         return nil;
     }
 
-    NSCharacterSet *delims = [NSCharacterSet characterSetWithCharactersInString:@"/?#"];
+    static NSCharacterSet *delims;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        delims = [NSCharacterSet characterSetWithCharactersInString:@"/?#"];
+    });
     NSRange stop = [s rangeOfCharacterFromSet:delims
                                       options:0
                                         range:NSMakeRange(start, s.length - start)];
@@ -156,8 +160,64 @@ static NSString *ABHostFromURLString(NSString *s)
     return authority.length ? authority : nil;
 }
 
+static NSString *ABPathAndQueryFromURLString(NSString *s)
+{
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) {
+        return nil;
+    }
+
+    NSRange schemeRange = [s rangeOfString:@"://"];
+    NSUInteger searchFrom = (schemeRange.location == NSNotFound) ? 0 : NSMaxRange(schemeRange);
+    if (searchFrom >= s.length) {
+        return nil;
+    }
+
+    static NSCharacterSet *delims;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        delims = [NSCharacterSet characterSetWithCharactersInString:@"/?#"];
+    });
+    NSRange delim = [s rangeOfCharacterFromSet:delims
+                                       options:0
+                                         range:NSMakeRange(searchFrom, s.length - searchFrom)];
+    if (delim.location == NSNotFound) {
+        return nil;
+    }
+
+    NSString *rest = [s substringFromIndex:delim.location];
+    return rest.length ? rest : nil;
+}
+
+static NSString *ABPathOnlyFromURLString(NSString *s)
+{
+    NSString *pathAndQuery = ABPathAndQueryFromURLString(s);
+    if (pathAndQuery.length == 0) {
+        return nil;
+    }
+
+    static NSCharacterSet *cutSet;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cutSet = [NSCharacterSet characterSetWithCharactersInString:@"?#"];
+    });
+    NSRange cut = [pathAndQuery rangeOfCharacterFromSet:cutSet];
+    NSString *path = (cut.location == NSNotFound)
+        ? pathAndQuery
+        : [pathAndQuery substringToIndex:cut.location];
+    return path.length ? path : nil;
+}
+
+static NSString *ABTruncate(NSString *s, NSUInteger maxLen)
+{
+    if (s.length <= maxLen) {
+        return s;
+    }
+    return [[s substringToIndex:maxLen - 3] stringByAppendingString:@"..."];
+}
+
 // 把用户输入整理成关键词：
-//   - 如果粘贴的是完整 URL，自动取 host；
+//   - 粘贴纯域名 / 无路径 URL 时取 host；
+//   - 粘贴带路径或查询的 URL 时保留 path+query，用来拦接口；
 //   - 去掉开头的 *.；
 //   - 统一小写。
 static NSString *ABNormalizeKeyword(NSString *input)
@@ -169,6 +229,15 @@ static NSString *ABNormalizeKeyword(NSString *input)
 
     NSString *host = ABHostFromURLString(s);
     if (host.length) {
+        NSString *pathAndQuery = ABPathAndQueryFromURLString(s);
+        NSString *pathOnly = ABPathOnlyFromURLString(s);
+        BOOL meaningfulPath = pathOnly.length > 1;
+        BOOL meaningfulQuery = [pathAndQuery rangeOfString:@"?"].location != NSNotFound &&
+                               pathAndQuery.length > 1;
+        if (meaningfulPath || meaningfulQuery) {
+            s = [[host stringByAppendingString:pathAndQuery] lowercaseString];
+            return s.length ? s : nil;
+        }
         s = host;
     }
 
@@ -185,12 +254,13 @@ static NSString *ABNormalizeKeyword(NSString *input)
 }
 
 // 匹配规则：
-//   1. 带点的关键词按域名后缀匹配：
+//   1. 带点且不含 / 的关键词按域名后缀匹配：
 //        toutiao.com 匹配 toutiao.com、ads.toutiao.com，
 //        不匹配 nottoutiao.com；
-//   2. 不带点的关键词按“包含”匹配：
-//        toutiao 匹配 pglstatp-toutiao.com；
-//   3. 支持 *.example.com。
+//   2. 不带点的关键词按“包含”匹配 host 和完整 URL：
+//        advertise 匹配 https://cdn.example.com/api/advertise；
+//   3. 所有关键词都会在 path/query 里做包含匹配；
+//   4. 支持 *.example.com。
 static BOOL ABHostMatchesKeyword(NSString *host, NSString *keyword)
 {
     if (host.length == 0 || keyword.length == 0) {
@@ -208,22 +278,70 @@ static BOOL ABHostMatchesKeyword(NSString *host, NSString *keyword)
                [host hasSuffix:[@"." stringByAppendingString:base]];
     }
 
-    if ([kw rangeOfString:@"."].location != NSNotFound) {
+    if ([kw rangeOfString:@"."].location != NSNotFound &&
+        [kw rangeOfString:@"/"].location == NSNotFound &&
+        [kw rangeOfString:@":"].location == NSNotFound) {
         return [host isEqualToString:kw] ||
-               [host hasSuffix:[@"." stringByAppendingString:kw]];
+               [host hasSuffix:[@"." stringByAppendingString:kw]] ||
+               [host hasPrefix:[kw stringByAppendingString:@"."]];
     }
 
     return [host rangeOfString:kw].location != NSNotFound;
 }
 
-static BOOL ABHostMatchesAny(NSString *host, NSArray<NSString *> *keywords)
+static BOOL ABURLMatchesKeywordPrepared(NSString *urlLower,
+                                        NSString *hostLower,
+                                        NSString *pathAndQueryLower,
+                                        NSString *keyword)
 {
-    if (host.length == 0 || keywords.count == 0) {
+    if (keyword.length == 0) {
         return NO;
     }
 
+    NSString *kw = [keyword lowercaseString];
+    if ([kw hasPrefix:@"*."]) {
+        kw = [kw substringFromIndex:2];
+        if (kw.length == 0) {
+            return NO;
+        }
+    }
+
+    if (hostLower.length && ABHostMatchesKeyword(hostLower, kw)) {
+        return YES;
+    }
+
+    if (pathAndQueryLower.length &&
+        [pathAndQueryLower rangeOfString:kw].location != NSNotFound) {
+        return YES;
+    }
+
+    BOOL looksLikeDomain = [kw rangeOfString:@"."].location != NSNotFound &&
+                           [kw rangeOfString:@"/"].location == NSNotFound &&
+                           [kw rangeOfString:@":"].location == NSNotFound;
+    if (!looksLikeDomain &&
+        urlLower.length &&
+        [urlLower rangeOfString:kw].location != NSNotFound) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static BOOL ABURLMatchesAny(NSString *urlString, NSString *host, NSArray<NSString *> *keywords)
+{
+    if (keywords.count == 0) {
+        return NO;
+    }
+    if (urlString.length == 0 && host.length == 0) {
+        return NO;
+    }
+
+    NSString *urlLower = urlString.length ? [urlString lowercaseString] : @"";
+    NSString *hostLower = host.length ? [host lowercaseString] : @"";
+    NSString *pathAndQueryLower = ABPathAndQueryFromURLString(urlLower);
+
     for (NSString *kw in keywords) {
-        if (ABHostMatchesKeyword(host, kw)) {
+        if (ABURLMatchesKeywordPrepared(urlLower, hostLower, pathAndQueryLower, kw)) {
             return YES;
         }
     }
@@ -444,7 +562,7 @@ static NSArray<NSString *> *ABDefaultBlacklist(void)
 // ============================================================
 
 // 只根据黑白名单计算“是否应该拦截”，不处理观察者/关网开关。
-static BOOL ABListDecision(NSString *host, NSString **reasonOut)
+static BOOL ABListDecision(NSString *urlString, NSString *host, NSString **reasonOut)
 {
     ABConfig *cfg = [ABConfig shared];
 
@@ -454,7 +572,7 @@ static BOOL ABListDecision(NSString *host, NSString **reasonOut)
     }
 
     if (cfg.mode == ABModeWhitelist) {
-        if (ABHostMatchesAny(host, cfg.whitelist)) {
+        if (ABURLMatchesAny(urlString, host, cfg.whitelist)) {
             if (reasonOut) *reasonOut = @"whitelist";
             return NO;
         }
@@ -462,14 +580,13 @@ static BOOL ABListDecision(NSString *host, NSString **reasonOut)
         return YES;
     }
 
-    // 黑名单模式：白名单作为例外优先。
     if (cfg.whitelistException &&
-        ABHostMatchesAny(host, cfg.whitelist)) {
+        ABURLMatchesAny(urlString, host, cfg.whitelist)) {
         if (reasonOut) *reasonOut = @"whitelist-exception";
         return NO;
     }
 
-    if (ABHostMatchesAny(host, cfg.blacklist)) {
+    if (ABURLMatchesAny(urlString, host, cfg.blacklist)) {
         if (reasonOut) *reasonOut = @"blacklist";
         return YES;
     }
@@ -481,7 +598,7 @@ static BOOL ABListDecision(NSString *host, NSString **reasonOut)
 // 最终是否拦截：
 //   - 关网开关优先；
 //   - 观察者模式只记录，不拦截（关网开关除外）。
-static BOOL ABShouldBlockHost(NSString *host, NSString **reasonOut)
+static BOOL ABShouldBlockURL(NSString *urlString, NSString *host, NSString **reasonOut)
 {
     ABConfig *cfg = [ABConfig shared];
 
@@ -491,7 +608,7 @@ static BOOL ABShouldBlockHost(NSString *host, NSString **reasonOut)
     }
 
     NSString *listReason = nil;
-    BOOL listBlock = ABListDecision(host, &listReason);
+    BOOL listBlock = ABListDecision(urlString, host, &listReason);
 
     if (cfg.observer) {
         if (reasonOut) {
@@ -510,35 +627,45 @@ static BOOL ABShouldBlockHost(NSString *host, NSString **reasonOut)
     return listBlock;
 }
 
-// 给设置界面的“测试”使用：不写日志，只返回结果。
 static NSString *ABDecisionSummaryForString(NSString *input)
 {
-    NSString *host = ABHostFromURLString(input);
+    NSString *raw = ABTrim(input);
+    if (raw.length == 0) {
+        return @"无法识别域名或 URL";
+    }
+
+    NSString *host = ABHostFromURLString(raw);
+    NSString *urlString = host.length ? raw : nil;
     if (host.length == 0) {
-        host = ABNormalizeKeyword(input);
+        host = ABNormalizeKeyword(raw);
     }
     if (host.length == 0) {
         return @"无法识别域名或 URL";
     }
 
     NSString *reason = nil;
-    BOOL block = ABShouldBlockHost(host, &reason);
+    BOOL block = ABShouldBlockURL(urlString ?: raw, host, &reason);
+    NSString *path = ABPathOnlyFromURLString(raw);
 
     return [NSString stringWithFormat:
-            @"域名：%@\n结果：%@\n原因：%@",
+            @"域名：%@\n路径：%@\n结果：%@\n原因：%@",
             host,
+            path.length ? path : @"-",
             block ? @"拦截" : @"放行",
             reason ?: @"-"];
 }
 
 // ============================================================
-// 日志（只记录域名）
+// 日志（记录域名和路径，不记录查询参数）
 // ============================================================
 
 @interface ABLogStore : NSObject
 
 + (instancetype)shared;
-- (void)addHost:(NSString *)host block:(BOOL)block reason:(NSString *)reason;
+- (void)addURL:(NSString *)urlString
+          host:(NSString *)host
+         block:(BOOL)block
+        reason:(NSString *)reason;
 - (NSArray<NSDictionary *> *)snapshot;
 - (void)clear;
 
@@ -547,6 +674,7 @@ static NSString *ABDecisionSummaryForString(NSString *input)
 @implementation ABLogStore {
     NSMutableArray<NSDictionary *> *_entries;
     dispatch_queue_t _queue;
+    NSDateFormatter *_formatter;
 }
 
 + (instancetype)shared
@@ -565,28 +693,40 @@ static NSString *ABDecisionSummaryForString(NSString *input)
     if (self) {
         _entries = [NSMutableArray array];
         _queue = dispatch_queue_create("com.ab.adblock.log", DISPATCH_QUEUE_SERIAL);
+        _formatter = [[NSDateFormatter alloc] init];
+        _formatter.dateFormat = @"HH:mm:ss";
     }
     return self;
 }
 
-- (void)addHost:(NSString *)host block:(BOOL)block reason:(NSString *)reason
+- (void)addURL:(NSString *)urlString
+          host:(NSString *)host
+         block:(BOOL)block
+        reason:(NSString *)reason
 {
-    if (host.length == 0) {
+    if (host.length == 0 && urlString.length == 0) {
         return;
     }
 
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    [fmt setDateFormat:@"HH:mm:ss"];
-    NSString *time = [fmt stringFromDate:[NSDate date]];
-
-    NSDictionary *entry = @{
-        @"time": time ?: @"",
-        @"host": host,
-        @"block": @(block),
-        @"reason": reason ?: @""
-    };
+    NSString *path = ABPathOnlyFromURLString(urlString);
+    NSString *hostCopy = [host copy] ?: @"";
+    NSString *reasonCopy = [reason copy] ?: @"";
+    NSString *display = hostCopy;
+    if (path.length > 1) {
+        display = ABTruncate([display stringByAppendingString:path], 96);
+    }
+    NSDate *now = [NSDate date];
 
     dispatch_async(_queue, ^{
+        NSString *time = [self->_formatter stringFromDate:now] ?: @"";
+        NSDictionary *entry = @{
+            @"time": time,
+            @"host": hostCopy,
+            @"path": path ?: @"",
+            @"display": display,
+            @"block": @(block),
+            @"reason": reasonCopy
+        };
         [self->_entries addObject:entry];
         if (self->_entries.count > (NSUInteger)kABMaxLogEntries) {
             [self->_entries removeObjectsInRange:
@@ -633,11 +773,11 @@ static NSString *ABProcessURLStringInner(NSString *s)
     }
 
     NSString *reason = nil;
-    BOOL block = ABShouldBlockHost(host, &reason);
+    BOOL block = ABShouldBlockURL(s, host, &reason);
 
     ABConfig *cfg = [ABConfig shared];
     if (cfg.observer || cfg.blockAll || block) {
-        [[ABLogStore shared] addHost:host block:block reason:reason ?: @""];
+        [[ABLogStore shared] addURL:s host:host block:block reason:reason ?: @""];
     }
 
     return block ? kABBlockedURL : s;
@@ -1314,7 +1454,7 @@ static void ABShowStartupOverlay(void)
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
-    return @"只记录域名，不记录路径和查询参数";
+    return @"记录域名和路径，不记录查询参数";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -1336,7 +1476,7 @@ static void ABShowStartupOverlay(void)
     }
 
     NSDictionary *entry = self.logs[indexPath.row];
-    cell.textLabel.text = entry[@"host"];
+    cell.textLabel.text = entry[@"display"] ?: entry[@"host"];
     cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  %@  %@",
                                  entry[@"time"] ?: @"",
                                  [entry[@"block"] boolValue] ? @"拦截" : @"放行",
@@ -1464,11 +1604,11 @@ typedef NS_ENUM(NSInteger, ABSettingsSection) {
         case ABSettingsSectionMode:
             return @"黑名单：默认放行，命中拦截。白名单：默认拦截，命中放行，可能导致 App 无法正常联网。";
         case ABSettingsSectionBlacklist:
-            return @"带点的关键词按域名后缀匹配，例如 toutiao.com 会匹配 ads.toutiao.com；不带点的按包含匹配。";
+            return @"带点的域名按后缀匹配，例如 toutiao.com 会匹配 ads.toutiao.com。不带点的关键词会匹配域名和完整 URL，例如 advertise 能拦住 /api/advertise。";
         case ABSettingsSectionWhitelist:
             return @"白名单优先于黑名单，适合把 App 自己的关键接口加进来做例外。";
         case ABSettingsSectionLogs:
-            return @"观察者模式开启后，这里会记录 App 请求过的域名，方便找广告域名。";
+            return @"观察者模式开启后，这里会记录 App 请求过的域名和路径，方便找广告接口。";
         case ABSettingsSectionTools:
             return @"启动时会在右下角显示 5 秒“设置”悬浮窗，按住可拖动位置；点击可直接打开本页。三指双击仍然有效。透明度与位置在下次启动生效。";
         default:
@@ -1783,11 +1923,11 @@ forRowAtIndexPath:(NSIndexPath *)indexPath
 
     UIAlertController *alert =
         [UIAlertController alertControllerWithTitle:title
-                                            message:@"可以填域名、域名关键词，或完整 URL。带点的域名会匹配子域名。"
+                                             message:@"可以填域名、路径关键词，或完整 URL。advertise 会匹配域名和整段 URL；toutiao.com 仍按域名后缀匹配。"
                                      preferredStyle:UIAlertControllerStyleAlert];
 
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = blacklist ? @"例如 toutiao.com" : @"例如 api.example.com";
+        textField.placeholder = blacklist ? @"例如 advertise 或 toutiao.com" : @"例如 api.example.com";
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         textField.autocorrectionType = UITextAutocorrectionTypeNo;
     }];

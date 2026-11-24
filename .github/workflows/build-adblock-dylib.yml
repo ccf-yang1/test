@@ -1,0 +1,35 @@
+name: Build AdBlockConfig dylib
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_ios:
+        description: iPhoneOS deployment target
+        required: false
+        default: "14.0"
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: adblock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: xcodebuild -version && xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylib
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: ${{ inputs.min_ios }}
+        run: bash ./build-dylib.sh
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdBlockConfig.dylib
+          path: dylib/AdBlockConfig.dylib
+          if-no-files-found: error
