@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
 
@@ -864,6 +865,48 @@ static BOOL ABWindowIsVisible(UIWindow *window)
            window.windowLevel >= UIWindowLevelNormal;
 }
 
+static UIWindow *ABCurrentKeyWindow(void)
+{
+    if (@available(iOS 13.0, *)) {
+        UIWindow *fallback = nil;
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) {
+                continue;
+            }
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            if (windowScene.activationState != UISceneActivationStateForegroundActive) {
+                continue;
+            }
+            for (UIWindow *window in windowScene.windows) {
+                if (!ABWindowIsVisible(window)) {
+                    continue;
+                }
+                if (window.isKeyWindow) {
+                    return window;
+                }
+                if (!fallback) {
+                    fallback = window;
+                }
+            }
+        }
+        if (fallback) {
+            return fallback;
+        }
+    }
+
+    for (UIWindow *window in [UIApplication sharedApplication].windows) {
+        if (window.isKeyWindow && ABWindowIsVisible(window)) {
+            return window;
+        }
+    }
+    for (UIWindow *window in [UIApplication sharedApplication].windows) {
+        if (ABWindowIsVisible(window)) {
+            return window;
+        }
+    }
+    return nil;
+}
+
 static NSArray<UIWindow *> *ABAllWindows(void)
 {
     NSMutableArray<UIWindow *> *result = [NSMutableArray array];
@@ -1118,7 +1161,7 @@ static void ABUpdateStartupOverlayPosition(void);
     }
 
     CGSize screenSize = [UIScreen mainScreen].bounds.size;
-    UIWindow *reference = [UIApplication sharedApplication].keyWindow;
+    UIWindow *reference = ABCurrentKeyWindow();
     if (!reference || reference == window) {
         reference = window;
     }
@@ -1128,7 +1171,7 @@ static void ABUpdateStartupOverlayPosition(void);
     center.y += translation.y;
     center = ABClampStartupOverlayCenter(center, screenSize);
     window.center = center;
-    [gesture setTranslation:CGPointZero inView:reference];
+    [gesture setTranslation:CGPointMake(0, 0) inView:reference];
 
     if (gesture.state == UIGestureRecognizerStateBegan) {
         ABScheduleStartupOverlayAutoHide();
@@ -1218,7 +1261,7 @@ static NSString *ABStartupOverlayPositionName(void)
 static UIWindowScene *ABOverlayScene(void)
 {
     if (@available(iOS 13.0, *)) {
-        UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+        UIWindow *keyWindow = ABCurrentKeyWindow();
         if (keyWindow.windowScene) {
             return keyWindow.windowScene;
         }
@@ -2048,7 +2091,7 @@ static __weak UIWindow *gPreviousKeyWindow = nil;
         [[UINavigationController alloc] initWithRootViewController:settings];
     window.rootViewController = nav;
 
-    gPreviousKeyWindow = [UIApplication sharedApplication].keyWindow;
+    gPreviousKeyWindow = ABCurrentKeyWindow();
     window.hidden = NO;
     [window makeKeyAndVisible];
     gSettingsWindow = window;
@@ -2103,18 +2146,7 @@ static __weak UIWindow *gPreviousKeyWindow = nil;
     if (fallback) {
         return fallback;
     }
-
-    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-    if (ABWindowIsVisible(keyWindow)) {
-        return keyWindow;
-    }
-
-    for (UIWindow *window in [UIApplication sharedApplication].windows) {
-        if (ABWindowIsVisible(window)) {
-            return window;
-        }
-    }
-    return nil;
+    return ABCurrentKeyWindow();
 }
 
 + (UIWindowScene *)activeWindowScene

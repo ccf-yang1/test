@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = AdBlockConfig
 AdBlockConfig_FILES = test.x
-AdBlockConfig_FRAMEWORKS = UIKit Foundation WebKit
+AdBlockConfig_FRAMEWORKS = UIKit Foundation WebKit CoreGraphics
 AdBlockConfig_CFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk

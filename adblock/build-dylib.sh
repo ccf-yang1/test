@@ -55,8 +55,21 @@ build_arch() {
     -framework Foundation \
     -framework UIKit \
     -framework WebKit \
+    -framework CoreGraphics \
+    -Wno-deprecated-declarations \
     -o "$dest" \
     "$SRC"
+}
+
+build_arch_optional() {
+  local arch="$1"
+  local dest="$2"
+  if build_arch "$arch" "$dest"; then
+    return 0
+  fi
+  echo "${arch} build failed, continuing without it"
+  rm -f "$dest"
+  return 1
 }
 
 ARM64="$TMPDIR_BUILD/AdBlockConfig.arm64.dylib"
@@ -64,7 +77,7 @@ ARM64E="$TMPDIR_BUILD/AdBlockConfig.arm64e.dylib"
 
 build_arch arm64 "$ARM64"
 
-if build_arch arm64e "$ARM64E"; then
+if build_arch_optional arm64e "$ARM64E"; then
   xcrun lipo -create "$ARM64" "$ARM64E" -output "$OUT"
 else
   echo "arm64e build skipped, using arm64 only"
