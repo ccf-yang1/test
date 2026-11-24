@@ -13,7 +13,7 @@
 // 说明：
 //   - 本文件是 Objective-C 注入源码，可用 Theos 或 clang 直接编成 dylib；
 //   - 只处理 http/https，不处理 file/data/about 等本地 URL；
-//   - 日志记录域名和路径，不记录查询参数。
+//   - 日志记录完整 URL（含路径和查询参数），方便对照黑名单。
 //
 // 已知边界：
 //   - WKWebView 的子资源请求可能发生在独立进程，URL hook 不一定能覆盖；
@@ -656,8 +656,22 @@ static NSString *ABDecisionSummaryForString(NSString *input)
             reason ?: @"-"];
 }
 
+static NSString *ABLogURLString(NSString *s)
+{
+    NSString *url = ABTrim(s);
+    if (url.length == 0) {
+        return nil;
+    }
+
+    NSRange hash = [url rangeOfString:@"#"];
+    if (hash.location != NSNotFound) {
+        url = [url substringToIndex:hash.location];
+    }
+    return url.length ? url : nil;
+}
+
 // ============================================================
-// 日志（记录域名和路径，不记录查询参数）
+// 日志（记录完整 URL）
 // ============================================================
 
 @interface ABLogStore : NSObject
@@ -709,29 +723,28 @@ static NSString *ABDecisionSummaryForString(NSString *input)
         return;
     }
 
-    NSString *path = ABPathOnlyFromURLString(urlString);
+    NSString *url = ABLogURLString(urlString) ?: (host ?: @"");
+    NSString *path = ABPathOnlyFromURLString(url);
     NSString *hostCopy = [host copy] ?: @"";
     NSString *reasonCopy = [reason copy] ?: @"";
-    NSString *display = hostCopy;
-    if (path.length > 1) {
-        display = ABTruncate([display stringByAppendingString:path], 96);
-    }
+    NSString *urlCopy = [url copy];
+    NSString *display = ABTruncate(urlCopy, 180);
     NSDate *now = [NSDate date];
 
     dispatch_async(_queue, ^{
         NSString *time = [self->_formatter stringFromDate:now] ?: @"";
         NSDictionary *entry = @{
             @"time": time,
+            @"url": urlCopy ?: @"",
             @"host": hostCopy,
             @"path": path ?: @"",
-            @"display": display,
+            @"display": display ?: hostCopy,
             @"block": @(block),
             @"reason": reasonCopy
         };
-        [self->_entries addObject:entry];
+        [self->_entries insertObject:entry atIndex:0];
         if (self->_entries.count > (NSUInteger)kABMaxLogEntries) {
-            [self->_entries removeObjectsInRange:
-             NSMakeRange(0, self->_entries.count - kABMaxLogEntries)];
+            [self->_entries removeLastObject];
         }
     });
 }
@@ -1447,6 +1460,9 @@ static void ABShowStartupOverlay(void)
 @interface ABLogViewController ()
 - (void)reloadLogs;
 - (void)clearLogs;
+- (void)showActionsForEntry:(NSDictionary *)entry;
+- (void)copyText:(NSString *)text;
+- (void)addKeyword:(NSString *)keyword blacklist:(BOOL)blacklist;
 @end
 
 @implementation ABLogViewController
@@ -1461,6 +1477,8 @@ static void ABShowStartupOverlay(void)
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(clearLogs)];
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 72.0;
     [self reloadLogs];
 }
 
@@ -1497,7 +1515,7 @@ static void ABShowStartupOverlay(void)
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
-    return @"记录域名和路径，不记录查询参数";
+    return @"最新请求在最上面，显示完整 URL。点一下可复制或加入黑白名单。";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -1516,10 +1534,16 @@ static void ABShowStartupOverlay(void)
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                       reuseIdentifier:identifier];
+        cell.textLabel.numberOfLines = 0;
+        cell.detailTextLabel.numberOfLines = 2;
+        cell.textLabel.lineBreakMode = NSLineBreakByCharWrapping;
+        cell.detailTextLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
 
     NSDictionary *entry = self.logs[indexPath.row];
-    cell.textLabel.text = entry[@"display"] ?: entry[@"host"];
+    NSString *url = entry[@"url"] ?: entry[@"display"] ?: entry[@"host"];
+    cell.textLabel.text = url;
     cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  %@  %@",
                                  entry[@"time"] ?: @"",
                                  [entry[@"block"] boolValue] ? @"拦截" : @"放行",
@@ -1527,8 +1551,89 @@ static void ABShowStartupOverlay(void)
     cell.detailTextLabel.textColor = [entry[@"block"] boolValue]
         ? [UIColor systemRedColor]
         : [UIColor secondaryLabelColor];
-    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (self.logs.count == 0 || indexPath.row >= (NSInteger)self.logs.count) {
+        return;
+    }
+    [self showActionsForEntry:self.logs[indexPath.row]];
+}
+
+- (void)showActionsForEntry:(NSDictionary *)entry
+{
+    NSString *url = entry[@"url"] ?: entry[@"display"] ?: @"";
+    NSString *host = entry[@"host"] ?: @"";
+    if (url.length == 0 && host.length == 0) {
+        return;
+    }
+
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"请求操作"
+                                            message:url.length ? url : host
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    if (url.length) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"复制 URL"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            [self copyText:url];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"加入黑名单"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            [self addKeyword:url blacklist:YES];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"加入白名单"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            [self addKeyword:url blacklist:NO];
+        }]];
+    }
+    if (host.length && ![host isEqualToString:url]) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"复制域名"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            [self copyText:host];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"把域名加入黑名单"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            [self addKeyword:host blacklist:YES];
+        }]];
+    }
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    UIPopoverPresentationController *popover = alert.popoverPresentationController;
+    if (popover) {
+        popover.sourceView = self.tableView;
+        popover.sourceRect = CGRectMake(CGRectGetMidX(self.tableView.bounds),
+                                        CGRectGetMidY(self.tableView.bounds),
+                                        1.0,
+                                        1.0);
+        popover.permittedArrowDirections = 0;
+    }
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)copyText:(NSString *)text
+{
+    if (text.length == 0) {
+        return;
+    }
+    [UIPasteboard generalPasteboard].string = text;
+}
+
+- (void)addKeyword:(NSString *)keyword blacklist:(BOOL)blacklist
+{
+    [[ABConfig shared] addKeyword:keyword blacklist:blacklist];
 }
 
 @end
@@ -1651,7 +1756,7 @@ typedef NS_ENUM(NSInteger, ABSettingsSection) {
         case ABSettingsSectionWhitelist:
             return @"白名单优先于黑名单，适合把 App 自己的关键接口加进来做例外。";
         case ABSettingsSectionLogs:
-            return @"观察者模式开启后，这里会记录 App 请求过的域名和路径，方便找广告接口。";
+            return @"观察者模式开启后，这里会记录完整 URL。点进最近请求可复制或加入黑白名单。";
         case ABSettingsSectionTools:
             return @"启动时会在右下角显示 5 秒“设置”悬浮窗，按住可拖动位置；点击可直接打开本页。三指双击仍然有效。透明度与位置在下次启动生效。";
         default:
